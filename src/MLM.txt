@@ -1,0 +1,562 @@
+def train_cond(model, cond_model, autoencoder, train_loader, train_dataset_len, optimizer, device):
+    """
+    Train the VAE model for one epoch with mixed precision.
+    """
+    # model = model.to(device)
+    #for epoch in range(n_epochs):
+    model.train()
+    # scaler = GradScaler()
+    epoch_loss = 0
+    quantization_losses = 0
+    q_losses = 0
+    mse_losses = 0
+    latent_losses = 0
+    indices_losses = 0
+    # class_names = ["TC", "WT", "ET"]  # Names of the classes
+    # Initialize dictionary to store sum of normalized losses
+    class_losses_sum_overall_wo = {"BG":0, 'NC': 0, 'ED': 0, 'ET': 0}
+    class_losses_sum_overall = {"BG":0, 'TC': 0, 'WT': 0, 'ET': 0}
+    # class_losses_sum_overall = {"BG":0, 'NC': 0}
+    batch_count = 0
+    # encodings_sumation = torch.zeros(64).to(device)
+    # dynamic_masking = DynamicAttentionMasking(num_classes=128)
+    torch.autograd.set_detect_anomaly(True)
+    
+    for step, batch in enumerate(train_loader):
+        print("i am danishs ")
+        # print("batch_count", batch_count)
+        # batch_count += 1
+        # print("step", step)
+        # print("length of train loader", len(train_loader))
+        with torch.no_grad():   
+            
+            # with autocast(device_type='cuda', enabled=True):
+            print("Training in Progress")
+            # mask = batch['mask'].to(device)
+            images={}
+            for key in ["t1n", "t2w", "t1c", "t2f"]:
+                if key in batch:
+                    images[key] = (batch[key])
+                    #print(f"image shape with modality {key} is", batch[key].shape)
+                else:
+                    raise KeyError(f"Key {key} not found in batch_data")  # Ensure key exists
+            # random_number = torch.randint(0, 1, (1,)).item()
+            # if random_number == 0:
+            images = torch.stack([images['t1n'], images['t2w'], images['t1c'], images['t2f']], dim=1)
+            print("images after stacking is of shape", images.shape)
+            # Get the segmentation mask from batch_data
+            if 'mask' in batch:
+                mask = batch['mask']
+                # print("image shape with seg_mask is", mask.shape)
+            else:
+                raise KeyError("Key 'segmentation' not found in batch_data") 
+            optimizer.zero_grad(set_to_none=True)
+            mask = mask.to(device)
+            # print("mask shape is", mask.shape)
+            # mask_up = mask[:, 1:, :, :, :]
+            # print("mask_up shape is", mask_up.shape)
+            
+            # if random_number != 0:
+            #     modality_keys = list(images.keys())
+            #     modality_to_remove = modality_keys[torch.randint(0, len(modality_keys), (1,)).item()]
+            #     # modality_to_remove = 't2'
+            #     images_missing = {key: (images[key] if key != modality_to_remove else torch.ones_like(images[key])) for key in images}
+            #     images = torch.stack([images_missing['t1n'], images_missing['t2w'], images_missing['t1c'], images_missing['t2f']], dim=1)
+            images = images.to(device)
+            print("images", images.shape)
+            autoencoder_latent=autoencoder.encoder(mask) 
+            autoencoder_latent = autoencoder.bottleneck(autoencoder_latent)
+            # autoencoder_latent=autoencoder.conv1(autoencoder_latent) 
+            # autoencoder_latent=autoencoder.conv2(autoencoder_latent) 
+            autoencoder_latent_indices=autoencoder.quantizer0.quantize(autoencoder_latent)
+            autoencoder_latent_indices_embeddingsss = autoencoder.quantizer0.embed(autoencoder_latent_indices)
+            autoencoder_latent_indices = autoencoder_latent_indices.long()
+            x_bot, x_bottt, quantized, quantized_loss = cond_model(images)
+            # autoencoder_latent_indices = autoencoder_latent_indices.view(autoencoder_latent_indices.shape[0], -1)
+            # print("autoencoder_latent_indices", autoencoder_latent_indices)
+        with autocast(device_type='cuda', enabled=False):
+
+            x_bot = x_bot.to(device)
+            mlm_out, logits_arg, confidence_reduced, masked_indices_gt, th_out = model(x_bot)
+            # csoine_sim_loss = cosine_loss(x_bottt.view(autoencoder_latent_indices.shape[0], -1), autoencoder_latent.view(autoencoder_latent_indices.shape[0], -1))
+            # autoencoder_latent_indices_embeddingsss_loss =  mse_loss(quantized, autoencoder_latent_indices_embeddingsss.float())
+            # print("autoencoder_latent_indices_embeddingsss_loss", autoencoder_latent_indices_embeddingsss_loss)
+            # print("csoine_sim_loss", csoine_sim_loss)
+            # dynamic_masking.update_counts(x_bot)
+            # # Compute loss with dynamic mask
+            # mask = dynamic_masking.compute_mask()
+            # print("mask dynamics shape is", mask[autoencoder_latent_indices].unsqueeze(1).shape)
+            # weighted_logits = x_bot * mask[autoencoder_latent_indices].unsqueeze(1)
+
+            
+            
+            autoencoder_latent_indices_masked = autoencoder_latent_indices.clone()
+            autoencoder_latent_indices_masked[confidence_reduced] = -1 
+            
+            cross_ent_loss = criterion(mlm_out, torch.unsqueeze(autoencoder_latent_indices, dim=1))
+            # cross_ent_loss_th = criterion(th_out, torch.unsqueeze(torch.argmax(x_bot, dim=1),dim=1))
+            cross_ent_loss2 = ce_loss2(mlm_out, autoencoder_latent_indices_masked)
+            gt_mask_th = (autoencoder_latent_indices == torch.argmax(x_bot, dim=1))
+            print("gt_mask_th", torch.sum(gt_mask_th))
+            mask_bool = gt_mask_th != 0
+
+            # Create the new channel where True becomes False and False becomes True
+            # So, we will flip the boolean values and convert it to 1 for False (original) and 0 for True (original)
+            inverse_channel = torch.where(mask_bool, torch.zeros_like(gt_mask_th), torch.ones_like(gt_mask_th))
+            print("inverse_channel", torch.sum(inverse_channel))
+            # Stack the original mask and the inverse channel along the channel dimension
+            result = [inverse_channel, gt_mask_th]
+            combined_mask = torch.stack(result, dim=1)
+            
+            # combined_mask_argmax = torch.argmax(combined_mask, dim=1)
+            # combined_mask_argmax = (combined_mask_argmax==1)
+            th_out_argmax = torch.argmax(th_out, dim=1)
+            th_out_argmax = (th_out_argmax==1)
+            th_loss = dice_loss3(th_out, combined_mask)
+            th_loss = th_loss.mean(dim=0)
+            # loss = th_loss[0]+th_loss[1]
+            loss = cross_ent_loss2
+            # loss = cross_ent_loss2
+            # x_bot_sm = torch.softmax(x_bot, dim=1)
+            mlm_out = torch.argmax(mlm_out, dim=1)
+            # print("cross_ent_loss1", cross_ent_loss)
+            # print("cross_ent_loss2", cross_ent_loss2)
+            # # print("autoencoder_latent_indices_embeddingsss_loss", autoencoder_latent_indices_embeddingsss_loss)
+            print("len where modified equal", torch.sum(mlm_out == autoencoder_latent_indices))
+            # print("len where mlm masking based on softmaxequal", torch.sum(masked_indices_gt == autoencoder_latent_indices))
+            # print("len where actual cond  equal", torch.sum(torch.argmax(x_bot, dim=1) == autoencoder_latent_indices))
+            print("len where equal after adiing mlm and cond", torch.sum(logits_arg == autoencoder_latent_indices))
+            print("len where equal", torch.sum(autoencoder_latent_indices == torch.argmax(x_bot, dim=1)))
+            print("len where equal", torch.sum((th_out_argmax) == gt_mask_th))
+            print("len where equal", (torch.sum(gt_mask_th.unsqueeze(dim=1)) == torch.sum(combined_mask[:,1, :, :, :])))
+            print("len where equal", torch.sum(combined_mask[:,1, :, :, :]))
+            print("spatial locations where both emebeddings matches", torch.sum(th_out_argmax*torch.argmax(x_bot, dim=1) == th_out_argmax*autoencoder_latent_indices))
+            print("torch unique values are", torch.sum(th_out_argmax))
+            # print("len where equal", (x_bot != autoencoder_latent_indices))
+            # mismatch_map = (x_bot != autoencoder_latent_indices).int()
+            
+            # # Extract mismatch indices
+            # mismatch_indices = torch.nonzero(mismatch_map, as_tuple=True)
+            
+            # # Print results
+            # print("Mismatch Map:\n", mismatch_map)
+            # print("Mismatch Indices:", mismatch_indices)
+            # print("len where equal", torch.sum(x_bot_sm<0.5))
+            # weighted_logits = torch.argmax(weighted_logits, dim=1)
+            # print("len where mask dynamics", torch.sum(weighted_logits == autoencoder_latent_indices))
+            # print("lem where flatten", torch.sum(x_bot.view(x_bot.shape[0], -1) == autoencoder_latent_indices.view(autoencoder_latent_indices.shape[0], -1)))
+            # non_zero_count = torch.count_nonzero(encodings_sum)
+            # print(f"Number of non-zero elements: {non_zero_count}")
+            
+            print("cross_ent_loss is", loss)
+            
+            # combined_loss = (mse_loss(reconstruction, images))
+            # print("combined_loss is", combined_loss)
+            # print("quantization_losses is", q_loss)
+            batch_images = batch['mask'].shape[0]
+
+            # loss = (combined_loss+q_loss+cross_ent_loss)
+            # print("total loss is", loss)
+            # loss_tr = loss*batch_images
+            # mse_loss_tr = combined_loss*batch_images
+            # q_loss = q_loss*batch_images
+            cross_ent_loss = loss*batch_images
+            # indices_loss = indices_loss*batch_images
+            # quantization_loss=quantization_loss.item()*batch_images
+    
+        scaler.scale(loss).backward()  # Scale loss and perform backward pass
+        # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5)
+        # for name, param in model.named_parameters():
+        #     # writer.add_scalar(f'{name}', param.item(), step)
+        #     if param.grad is not None:
+        #         writer.add_scalar(f'gradients/{name}', param.grad.norm().item(), step)
+        scaler.step(optimizer)  # Update model parameters
+        scaler.update()
+    
+    
+        # epoch_loss += loss_tr.item()
+        # q_losses += q_loss.item()
+        # mse_losses += mse_loss_tr.item()
+        latent_losses += cross_ent_loss.item()
+        
+        # indices_losses += indices_loss.item()
+    # Return the average loss over the epoch
+    # writer.close()
+    # dynamic_masking.index_counts.zero_()
+    return latent_losses / train_dataset_len
+
+
+
+
+
+def validate_cond(model, cond_model, autoencoder, dataloader, val_dataset_len, device):
+    """
+    Validate the VAE model on the validation dataset.
+    """
+    print("Validation in Progress")
+    # model = model.to(device)
+    model.eval()  # Set the model to evaluation mode
+    val_loss = 0  # Initialize total loss accumulator
+    q_losses = 0
+    mse_losses = 0
+    quantization_losses = 0
+    latent_losses = 0
+    indices_losses = 0
+    class_losses_sum_overall_wo = {'ET': 0}
+    class_losses_sum_overall = {'BG': 0, 'TC': 0, 'WT': 0, 'ET': 0}
+    # class_losses_sum_overall = {'BG': 0, 'NC': 0}
+    with torch.no_grad():  # Disable gradient computation for validation
+        
+        for val_step, batch in enumerate(dataloader):
+            
+                       
+            images={}
+            for key in ["t1n", "t2w", "t1c", "t2f"]:
+                if key in batch:
+                    images[key] = (batch[key])
+                   # print(f"image shape with modality {key} is", batch[key].shape)
+                else:
+                    raise KeyError(f"Key {key} not found in batch_data")  # Ensure key exists
+        
+            # # Stack modalities along the channel dimension (dim=1)
+            # random_number = torch.randint(0, 1, (1,)).item()
+            # if random_number == 0:
+            images = torch.stack([images['t1n'], images['t2w'], images['t1c'], images['t2f']], dim=1)
+            print("image shape with stacked modality is", images.shape)
+            # images = batch['t2f']
+            # Get the segmentation mask from batch_data
+            if 'mask' in batch:
+                mask = batch['mask']
+                # print("image shape with seg_mask is", mask.shape)
+            else:
+                raise KeyError("Key 'segmentation' not found in batch_data") 
+
+            mask = mask.to(device)
+            # mask_up = mask[:,1:,:,:,:]
+
+            # if random_number != 0:
+            #     modality_keys = list(images.keys())
+            #     modality_to_remove = modality_keys[torch.randint(0, len(modality_keys), (1,)).item()]
+            #     # modality_to_remove = 't2'
+            #     images_missing = {key: (images[key] if key != modality_to_remove else torch.ones_like(images[key])) for key in images}
+            #     images = torch.stack([images_missing['t1n'], images_missing['t2w'], images_missing['t1c'], images_missing['t2f']], dim=1)
+            #     print("images", images.shape)
+            images = images.to(device)
+            autoencoder_latent=autoencoder.encoder(mask) 
+            autoencoder_latent = autoencoder.bottleneck(autoencoder_latent)
+            # autoencoder_latent=autoencoder.conv1(autoencoder_latent) 
+            # autoencoder_latent=autoencoder.conv2(autoencoder_latent) 
+            autoencoder_latent_indices=autoencoder.quantizer0.quantize(autoencoder_latent)
+            autoencoder_latent_indices_embeddingsss = autoencoder.quantizer0.embed(autoencoder_latent_indices)
+            autoencoder_latent_indices = autoencoder_latent_indices.long()
+            x_bot, x_bottt, quantized, quantized_loss = cond_model(images)
+            with autocast(device_type='cuda', enabled=False):                 
+                
+                # autoencoder_latent_indices = autoencoder_latent_indices.view(autoencoder_latent_indices.shape[0], -1)
+                # print("autoencoder_latent_indices", autoencoder_latent_indices)
+                x_bot = x_bot.to(device)
+                mlm_out, logits_arg, confidence_reduced, masked_indices_gt, th_out = model(x_bot)
+                # csoine_sim_loss = cosine_loss(x_bottt.view(autoencoder_latent_indices.shape[0], -1), autoencoder_latent.view(autoencoder_latent_indices.shape[0], -1))
+                # autoencoder_latent_indices_embeddingsss_loss =  mse_loss(quantized, autoencoder_latent_indices_embeddingsss.float())
+                # print("autoencoder_latent_indices_embeddingsss_loss", autoencoder_latent_indices_embeddingsss_loss)
+                # print("csoine_sim_loss", csoine_sim_loss)
+                autoencoder_latent_indices_masked = autoencoder_latent_indices.clone()
+                autoencoder_latent_indices_masked[confidence_reduced] = -1 
+                
+                cross_ent_loss = criterion(mlm_out, torch.unsqueeze(autoencoder_latent_indices, dim=1))
+                cross_ent_loss2 = ce_loss2(mlm_out, autoencoder_latent_indices_masked)
+                gt_mask_th = (autoencoder_latent_indices == torch.argmax(x_bot, dim=1))
+                print("gt_mask_th", torch.sum(gt_mask_th))
+                mask_bool = gt_mask_th != 0
+    
+                # Create the new channel where True becomes False and False becomes True
+                # So, we will flip the boolean values and convert it to 1 for False (original) and 0 for True (original)
+                inverse_channel = torch.where(mask_bool, torch.zeros_like(gt_mask_th), torch.ones_like(gt_mask_th))
+                print("inverse_channel", torch.sum(inverse_channel))
+                # Stack the original mask and the inverse channel along the channel dimension
+                result = [inverse_channel, gt_mask_th]
+                combined_mask = torch.stack(result, dim=1)
+                
+                # combined_mask_argmax = torch.argmax(combined_mask, dim=1)
+                # combined_mask_argmax = (combined_mask_argmax==1)
+                th_out_argmax = torch.argmax(th_out, dim=1)
+                th_out_argmax = (th_out_argmax==1)
+                th_loss = dice_loss3(th_out, combined_mask)
+                th_loss = th_loss.mean(dim=0)
+                # loss = th_loss[0]+th_loss[1]
+                loss = cross_ent_loss2
+                x_bot_sm = torch.argmax(x_bot, dim=1)
+                mlm_out = torch.argmax(mlm_out, dim=1)
+                # print("cross_ent_loss1", cross_ent_loss)
+                # print("cross_ent_loss2", cross_ent_loss2)
+                # print("autoencoder_latent_indices_embeddingsss_loss", autoencoder_latent_indices_embeddingsss_loss)
+                # print("len where equal", torch.sum(mlm_out == autoencoder_latent_indices))
+                # print("len where equal", torch.sum(masked_indices_gt == autoencoder_latent_indices))
+                print("len where equal", torch.sum(logits_arg == autoencoder_latent_indices))
+                print("len where equal", torch.sum(autoencoder_latent_indices == torch.argmax(x_bot, dim=1)))
+                print("len where equal", torch.sum((th_out_argmax) == gt_mask_th))
+                print("len where equal", (torch.sum(gt_mask_th.unsqueeze(dim=1)) == torch.sum(combined_mask[:,1, :, :, :])))
+                print("len where equal", torch.sum(combined_mask[:,1, :, :, :]))
+                embeddingsss = autoencoder.quantizer0.embed(logits_arg)
+                # z_quantized0_post = autoencoder.conv3(embeddingsss)
+                # z_quantized0_post = autoencoder.conv4(z_quantized0_post)
+
+                # autoencoder_latent_indices_x_bottt=autoencoder.quantizer0.quantize(mlm_out)
+                # autoencoder_latent_indices_embeddingsss_xbot = autoencoder.quantizer0.embed(autoencoder_latent_indices_x_bottt)
+        
+                # Decoder path with skip connections
+                reconstruction = autoencoder.decoder(embeddingsss)
+                reconstruction = autoencoder.segmentation(reconstruction)
+
+
+                combined_loss = dice_loss(reconstruction, mask)
+                # print("combined_loss shape is", combined_loss.shape)
+                combined_loss = combined_loss.mean(dim=0)
+
+
+                # print(f"BG_loss_{combined_loss[0]}_____________NC_loss_{combined_loss[1]}___________ED_loss_{combined_loss[2]}_____________ET_loss_{combined_loss[3]}")
+                print(f"ET_loss_{combined_loss}")
+
+                # loss_BG = combined_loss[0]
+                # class_losses_sum_overall+=
+                # print("combined_loss shape is", combined_loss.shape)
+                # print("combined_loss is", combined_loss)
+                # loss_NC = combined_loss[1]
+                # print("loss_NC is", loss_NC.shape)
+                # print("loss_NC is", loss_NC)
+                # print("loss_NC is", loss_NC.item())
+                # loss_ED = combined_loss[2]
+                # print("loss_ED is", loss_ED.shape)
+                # print("loss_ED is", loss_ED)
+                # print("loss_ED is", loss_ED.item())
+                loss_EN = combined_loss
+                # print("loss_ED is", loss_EN.shape)
+                # print("loss_ED is", loss_EN)
+                # print("loss_ED is", loss_EN.item())
+                
+    
+                # max_combined_loss = max(norm_NC, norm_ED, norm_EN)
+                # norm_NC = (norm_NC+1e-4)/(max_combined_loss+1e-4)
+                # norm_ED = (norm_ED+1e-4)/(max_combined_loss+1e-4)
+                # norm_EN = (norm_EN+1e-4)/(max_combined_loss+1e-4)
+                
+                quantization_loss = 0
+                # re_norm_combined_loss = ((loss_EN))
+                # print("re_norm_combined_loss", re_norm_combined_loss)
+                    
+                # print("combined_loss", combined_loss)
+                # # quantization_loss = quantization_loss/max_total_loss
+                # # print("quantization_losses is", quantization_loss)
+                batch_images = batch['mask'].shape[0]
+
+                # mask = torch.argmax(mask, dim=1)
+                # mask = [(mask == 0), (mask == 1) | (mask == 3), (mask == 1) | (mask == 3) | (mask == 2), (mask == 3)]
+                # mask = torch.stack(mask, dim=1).float()
+
+                # print("Updated mask shape is", mask.shape)  # Should be (8, 4, 120, 120, 96)
+
+                # # mask = torch.stack(mask, dim=1).float()
+                # # print("mask shape is", mask.shape)
+                # # reconstruction = torch.softmax(reconstruction, 1)
+                # reconstruction = torch.argmax(reconstruction, dim=1)
+                # reconstruction = [(reconstruction == 0), (reconstruction == 1) | (reconstruction == 3), (reconstruction == 1) | (reconstruction == 3) | (reconstruction == 2), (reconstruction == 3)]
+                # reconstruction = torch.stack(reconstruction, dim=1).float()
+                # print("reconstruction shape is", reconstruction.shape)
+                # combined_loss_bts = dice_loss(reconstruction, mask)
+                # combined_loss_bts = combined_loss_bts.mean(dim=0)
+    
+                # print(f"BG_loss_{combined_loss_bts[0]}__________TC_loss_{combined_loss_bts[1]}___________WT_loss_{combined_loss_bts[2]}_____________ET_loss_{combined_loss_bts[3]}")
+
+                for idx, (key, value) in enumerate(class_losses_sum_overall_wo.items()):
+                    class_losses_sum_overall_wo[key]+=((combined_loss[idx].item())*batch_images)
+
+                # for idx, (key, value) in enumerate(class_losses_sum_overall.items()):
+                #     class_losses_sum_overall[key]+=((combined_loss_bts[idx].item())*batch_images)
+                loss = loss*batch_images
+                # indices_loss = indices_loss*batch_images
+                # loss_val = loss*batch_images
+                
+                
+                # quantization_loss=quantization_loss.item()*batch_images
+
+    
+
+    
+            
+            # val_loss += loss_val.item()  # Accumulate the loss value
+            # q_losses += q_loss.item()
+            # mse_losses += mse_loss_val.item()
+                latent_losses += loss.item()
+            # indices_losses += indices_loss.item()
+    for key, value in class_losses_sum_overall_wo.items():
+        class_losses_sum_overall_wo[key] = value / val_dataset_len
+    
+    for key, value in class_losses_sum_overall.items():
+        class_losses_sum_overall[key] = value / val_dataset_len
+    latent_losses = latent_losses / val_dataset_len  
+    # Return the average loss over the validation dataset
+    return latent_losses, class_losses_sum_overall, class_losses_sum_overall_wo
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+class Encoder3D(nn.Module):
+    """Encoder consisting of multiple convolution blocks with increasing feature maps"""
+    def __init__(self, in_channels, dropout_prob=0.2):
+        super(Encoder3D, self).__init__()
+        
+        self.encoder1 = ConvBlock3D(in_channels, in_channels, dropout_prob)
+        self.encoder2 = ConvBlock3D(in_channels, in_channels, dropout_prob)
+        self.encoder3 = ConvBlock3D(in_channels, in_channels, dropout_prob)
+        self.encoder4 = ConvBlock3D(in_channels, in_channels, dropout_prob)
+        self.encoder5 = ConvBlock3D(in_channels*2, in_channels, dropout_prob)
+        self.encoder6 = ConvBlock3D(in_channels, 64, dropout_prob)
+        self.encoder7 = ConvBlock3D(64, 32, dropout_prob)
+        self.encoder8 = ConvBlock3D(32, 16, dropout_prob)
+        self.encoder9 = nn.Conv3d(16, 2, kernel_size=3, padding=1)
+        # # self.res5 = ResidualBlock(128)
+        # self.encoder6 = ConvBlock3D(128, 256, dropout_prob)
+        # # self.encoder7 = ConvBlock3D(256, 512, dropout_prob)
+        # # self.encoder8 = ConvBlock3D(512, 1024, dropout_prob)
+        # # self.encoder9 = ConvBlock3D(1024, 512, dropout_prob)
+        # self.pool = nn.MaxPool3d(2)
+        
+    def forward(self, x):
+        x1 = self.encoder1(x)
+        x1 = self.encoder2(x1)
+        x1 = self.encoder3(x1)
+        x1 = self.encoder4(x1)
+        x1 = torch.cat((x1,x), dim=1)
+        x1 = self.encoder5(x1)
+        x1 = self.encoder6(x1)
+        x1 = self.encoder7(x1)
+        print("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        x1 = self.encoder8(x1)
+        print("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        x1 = self.encoder9(x1)
+        x1 = torch.softmax(x1, dim=1)
+        return x1
+
+
+
+class TransformerModeldec_mlm(nn.Module):
+    """Transformer Model with Full Attention, Uncertainty Estimation, and Soft Masking."""
+    def __init__(self, input_shape, embed_dim, num_layers, num_heads):
+        super(TransformerModeldec_mlm, self).__init__()
+        h, w, d = input_shape
+        self.num_layers = num_layers
+        self.embed_dim = embed_dim
+        self.positional_encoding = PositionalEncoding3D_masked(vocab_size=129, embed_dim=embed_dim, 
+                                                        spatial_size=[h, w, d])
+        self.layers = nn.ModuleList([
+            TransformerBlockdec_mlm(embed_dim, num_heads)  # Remove nn.Sequential wrapper
+            for _ in range(num_layers)
+        ])
+        # self.fc_out = nn.Linear(n_embd, 129)  # Output layer for token prediction
+        # self.uncertainty_layers = nn.ModuleList([nn.Linear(embed_dim, 1) for _ in range(num_layers)])
+        self.emb = nn.Conv3d(256, 128, kernel_size=3)
+        self.enc = Encoder3D(128)
+    # def calculate_uncertainty(self, x, layer_idx):
+    #     """
+    #     Calculate token-level uncertainty for a specific layer using MC Dropout or learned variance.
+    #     """
+    #     variance = self.uncertainty_layers[layer_idx](x).sigmoid()  # Values in [0, 1]
+    #     return variance
+
+    def forward(self, x):
+        b, c, h, w, d = x.shape
+        th_out = self.enc(x)
+        softmax_output = torch.softmax(x, dim=1)  # logits shape: (batch, classes, depth, height, width)
+        max_prob, argmax_indices = torch.max(softmax_output, dim=1)
+        # print("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", torch.sum(((max_prob))>0.3))
+        # softmax_out = torch.softmax(x, dim=1)
+        # max_prob, argmax_indices = torch.max(softmax_out, dim=1)
+        # Step 2: Create a confidence mask (probability > 0.5)
+        # confidence_reduced = (max_prob > 0.2)  # Shape: (4, 128, 30, 30, 19)
+        
+        # Step 3: Get the most confident predictions (argmax along channel dimension)
+        # argmax_indices = torch.argmax(softmax_out, dim=1)  # Shape: (4, 30, 30, 19)
+        
+        # Step 4: Mask the argmax indices based on confidence
+        # Reduce the confidence mask to match the spatial dimensions
+        # confidence_reduced = confidence_mask.any(dim=1)  # Shape: (4, 30, 30, 19)
+        th_out_argmax = torch.argmax(th_out, dim=1)
+        th_out_argmax = (th_out_argmax==1)
+        # Apply the confidence mask to the argmax indices
+        masked_indices_gt = torch.where(th_out_argmax, argmax_indices, torch.tensor(128))  # -1 indicates masked
+        print("masked_indices_gt shape is", masked_indices_gt.shape)
+        padding = (1, 1, 0, 0, 0, 0)  # (left, right, top, bottom, front, back)
+        masked_indices = F.pad(masked_indices_gt, padding, mode='constant', value=128)
+
+        print("masked_indices shape is", masked_indices.shape)
+        
+        x = self.positional_encoding(masked_indices)
+        # gt_x = rearrange(gt_x, 'b c h w d -> b (h w d) c')
+        # masked_gt_list = []
+        # masked_out_list = []
+        for i, layer in enumerate(self.layers):
+            x, att = layer(x,i)
+
+            # print("at shape is", att.shape)
+            
+            # if i >= 5 and i < (self.num_layers - 1):  # After the 6th layer, estimate uncertainty and mask
+                
+            #     uncertainty = self.calculate_uncertainty(x, i)
+            #     # print("Uncertainty shape is", uncertainty.shape)
+                
+            #     # Calculate certainty mask
+            #     certainty_mask = 1 - uncertainty  # Certainty is the complement of uncertainty
+            #     x = x * certainty_mask  # Apply soft masking to the model's output
+                
+                # Apply the same mask to the ground truth
+                # masked_gt = gt_x * certainty_mask  # Mask the ground truth similarly
+                # masked_gt_list.append(masked_gt)  # Store masked GT for this layer
+                # masked_out_list.append(x)
+            
+        x = rearrange(x, 'b (h w d) c -> b c h w d', h=30, w=30, d=21)
+        logits = self.emb(x)
+        padding = (0, 0, 1, 1, 1, 1)  # (left, right, top, bottom, front, back)
+        logits = F.pad(logits, padding, mode='constant', value=0)
+        print("logits shape is", logits.shape)
+        logits_arg = torch.argmax(logits, dim=1)
+        logits_arg = torch.where(th_out_argmax, argmax_indices, logits_arg)
+        print("confidence mask shape is", torch.sum(th_out_argmax))
+        print("confidence mask shape is", torch.sum(logits_arg==argmax_indices))
+        confidence_reduced_unseq = th_out_argmax.unsqueeze(dim=1)
+        mask_expanded = confidence_reduced_unseq.expand(-1, 128, -1, -1, -1)
+        masked_logits = logits.clone()  # Make a copy of the logits so we don't modify the original logits
+        masked_logits[mask_expanded] = -1e10 
+        # gt_x_up = rearrange(gt_x_up, 'b (h w d) c -> b c h w d', h=h, w=w, d=d)
+
+        # logits = self.fc_out(attn_output)  # (B, T, vocab_size)
+        return masked_logits, logits_arg, th_out_argmax, masked_indices_gt, th_out
+
+
+
+
+

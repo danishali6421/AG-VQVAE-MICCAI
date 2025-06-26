@@ -1,0 +1,2247 @@
+from __future__ import annotations
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.amp import GradScaler, autocast
+import tqdm
+from torch.nn import L1Loss
+import visdom
+import nibabel as nib
+import numpy as np
+import os
+from monai.utils import first, set_determinism
+from torch.optim import Adam
+
+
+import warnings
+from collections.abc import Callable, Sequence
+from typing import Any
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.modules.loss import _Loss
+
+from monai.losses.focal_loss import FocalLoss
+from monai.losses.spatial_mask import MaskedLoss
+from monai.networks import one_hot
+from monai.utils import DiceCEReduction, LossReduction, Weight, deprecated_arg, look_up_option, pytorch_after
+
+mse_loss = L1Loss()
+class DiceLoss(_Loss):
+    """
+    Compute average Dice loss between two tensors. It can support both multi-classes and multi-labels tasks.
+    The data `input` (BNHW[D] where N is number of classes) is compared with ground truth `target` (BNHW[D]).
+
+    Note that axis N of `input` is expected to be logits or probabilities for each class, if passing logits as input,
+    must set `sigmoid=True` or `softmax=True`, or specifying `other_act`. And the same axis of `target`
+    can be 1 or N (one-hot format).
+
+    The `smooth_nr` and `smooth_dr` parameters are values added to the intersection and union components of
+    the inter-over-union calculation to smooth results respectively, these values should be small.
+
+    The original paper: Milletari, F. et. al. (2016) V-Net: Fully Convolutional Neural Networks forVolumetric
+    Medical Image Segmentation, 3DV, 2016.
+
+    """
+
+    def __init__(
+        self,
+        include_background: bool = True,
+        to_onehot_y: bool = False,
+        sigmoid: bool = False,
+        softmax: bool = False,
+        other_act: Callable | None = None,
+        squared_pred: bool = False,
+        jaccard: bool = False,
+        reduction: LossReduction | str = LossReduction.NONE,
+        smooth_nr: float = 1e-5,
+        smooth_dr: float = 1e-5,
+        batch: bool = False,
+        weight: Sequence[float] | float | int | torch.Tensor | None = None,
+    ) -> None:
+        """
+        Args:
+            include_background: if False, channel index 0 (background category) is excluded from the calculation.
+                if the non-background segmentations are small compared to the total image size they can get overwhelmed
+                by the signal from the background so excluding it in such cases helps convergence.
+            to_onehot_y: whether to convert the ``target`` into the one-hot format,
+                using the number of classes inferred from `input` (``input.shape[1]``). Defaults to False.
+            sigmoid: if True, apply a sigmoid function to the prediction.
+            softmax: if True, apply a softmax function to the prediction.
+            other_act: callable function to execute other activation layers, Defaults to ``None``. for example:
+                ``other_act = torch.tanh``.
+            squared_pred: use squared versions of targets and predictions in the denominator or not.
+            jaccard: compute Jaccard Index (soft IoU) instead of dice or not.
+            reduction: {``"none"``, ``"mean"``, ``"sum"``}
+                Specifies the reduction to apply to the output. Defaults to ``"mean"``.
+
+                - ``"none"``: no reduction will be applied.
+                - ``"mean"``: the sum of the output will be divided by the number of elements in the output.
+                - ``"sum"``: the output will be summed.
+
+            smooth_nr: a small constant added to the numerator to avoid zero.
+            smooth_dr: a small constant added to the denominator to avoid nan.
+            batch: whether to sum the intersection and union areas over the batch dimension before the dividing.
+                Defaults to False, a Dice loss value is computed independently from each item in the batch
+                before any `reduction`.
+            weight: weights to apply to the voxels of each class. If None no weights are applied.
+                The input can be a single value (same weight for all classes), a sequence of values (the length
+                of the sequence should be the same as the number of classes. If not ``include_background``,
+                the number of classes should not include the background category class 0).
+                The value/values should be no less than 0. Defaults to None.
+
+        Raises:
+            TypeError: When ``other_act`` is not an ``Optional[Callable]``.
+            ValueError: When more than 1 of [``sigmoid=True``, ``softmax=True``, ``other_act is not None``].
+                Incompatible values.
+
+        """
+        super().__init__(reduction=LossReduction(reduction).value)
+        if other_act is not None and not callable(other_act):
+            raise TypeError(f"other_act must be None or callable but is {type(other_act).__name__}.")
+        if int(sigmoid) + int(softmax) + int(other_act is not None) > 1:
+            raise ValueError("Incompatible values: more than 1 of [sigmoid=True, softmax=True, other_act is not None].")
+        self.include_background = include_background
+        self.to_onehot_y = to_onehot_y
+        self.sigmoid = sigmoid
+        self.softmax = softmax
+        self.other_act = other_act
+        self.squared_pred = squared_pred
+        self.jaccard = jaccard
+        self.smooth_nr = float(smooth_nr)
+        self.smooth_dr = float(smooth_dr)
+        self.batch = batch
+        weight = torch.as_tensor(weight) if weight is not None else None
+        self.register_buffer("class_weight", weight)
+        self.class_weight: None | torch.Tensor
+
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            input: the shape should be BNH[WD], where N is the number of classes.
+            target: the shape should be BNH[WD] or B1H[WD], where N is the number of classes.
+
+        Raises:
+            AssertionError: When input and target (after one hot transform if set)
+                have different shapes.
+            ValueError: When ``self.reduction`` is not one of ["mean", "sum", "none"].
+
+        Example:
+            >>> from monai.losses.dice import *  # NOQA
+            >>> import torch
+            >>> from monai.losses.dice import DiceLoss
+            >>> B, C, H, W = 7, 5, 3, 2
+            >>> input = torch.rand(B, C, H, W)
+            >>> target_idx = torch.randint(low=0, high=C - 1, size=(B, H, W)).long()
+            >>> target = one_hot(target_idx[:, None, ...], num_classes=C)
+            >>> self = DiceLoss(reduction='none')
+            >>> loss = self(input, target)
+            >>> assert np.broadcast_shapes(loss.shape, input.shape) == input.shape
+        """
+        if self.sigmoid:
+            input = torch.sigmoid(input)
+
+        n_pred_ch = input.shape[1]
+        if self.softmax:
+            if n_pred_ch == 1:
+                warnings.warn("single channel prediction, `softmax=True` ignored.")
+            else:
+                input = torch.softmax(input, 1)
+
+        if self.other_act is not None:
+            input = self.other_act(input)
+
+        if self.to_onehot_y:
+            if n_pred_ch == 1:
+                warnings.warn("single channel prediction, `to_onehot_y=True` ignored.")
+            else:
+                # print("target shape is", target.shape)
+                target = one_hot(target, num_classes=n_pred_ch)
+                # print("target shape is", target.shape)
+
+        if not self.include_background:
+            if n_pred_ch == 1:
+                warnings.warn("single channel prediction, `include_background=False` ignored.")
+            else:
+                # if skipping background, removing first channel
+                target = target[:, 1:]
+                input = input[:, 1:]
+                print("target shape is", target.shape)
+                print("input shape is", input.shape)
+
+        if target.shape != input.shape:
+            raise AssertionError(f"ground truth has different shape ({target.shape}) from input ({input.shape})")
+
+        # reducing only spatial dimensions (not batch nor channels)
+        reduce_axis: list[int] = torch.arange(2, len(input.shape)).tolist()
+        if self.batch:
+            # reducing spatial dimensions and batch
+            reduce_axis = [0] + reduce_axis
+
+        intersection = torch.sum(target * input, dim=reduce_axis)
+
+        if self.squared_pred:
+            ground_o = torch.sum(target**2, dim=reduce_axis)
+            pred_o = torch.sum(input**2, dim=reduce_axis)
+        else:
+            ground_o = torch.sum(target, dim=reduce_axis)
+            pred_o = torch.sum(input, dim=reduce_axis)
+
+        denominator = ground_o + pred_o
+        # print(f"Intersection: {intersection}")
+        # print(f"Denominator: {denominator}")
+
+        if self.jaccard:
+            denominator = 2.0 * (denominator - intersection)
+
+        f: torch.Tensor = 1.0 - (2.0 * intersection + self.smooth_nr) / (denominator + self.smooth_dr)
+        dice = 1.0 - (2.0 * intersection + self.smooth_nr) / (denominator + self.smooth_dr)
+        # print(f"Dice: {dice}")
+
+        num_of_classes = target.shape[1]
+        if self.class_weight is not None and num_of_classes != 1:
+            # make sure the lengths of weights are equal to the number of classes
+            if self.class_weight.ndim == 0:
+                self.class_weight = torch.as_tensor([self.class_weight] * num_of_classes)
+            else:
+                if self.class_weight.shape[0] != num_of_classes:
+                    raise ValueError(
+                        """the length of the `weight` sequence should be the same as the number of classes.
+                        If `include_background=False`, the weight should not include
+                        the background category class 0."""
+                    )
+            if self.class_weight.min() < 0:
+                raise ValueError("the value/values of the `weight` should be no less than 0.")
+            # apply class_weight to loss
+            f = f * self.class_weight.to(f)
+
+        if self.reduction == LossReduction.MEAN.value:
+            f = torch.mean(f)  # the batch and channel average
+        elif self.reduction == LossReduction.SUM.value:
+            f = torch.sum(f)  # sum over the batch and channel dims
+        elif self.reduction == LossReduction.NONE.value:
+            # If we are not computing voxelwise loss components at least
+            # make sure a none reduction maintains a broadcastable shape
+            broadcast_shape = list(f.shape[0:2]) + [1] * (len(input.shape) - 2)
+            f = f.view(broadcast_shape)
+        else:
+            raise ValueError(f'Unsupported reduction: {self.reduction}, available options are ["mean", "sum", "none"].')
+
+        return f
+# from losses import DiceCELoss
+# from monai.metrics import DiceMetric, compute_meandice, compute_hausdorff_distance, compute_average_surface_distance
+weight_BG = 1.0   # Weight for Edema class
+weight_ED = 1.0   # Weight for Edema class
+weight_NC = 2.0   # Weight for Necrotic Core class (higher because it's underperforming)
+weight_ET = 2.0   # Weight for Enhancing Tumor class (higher because it's underperforming)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+weights = torch.tensor([weight_BG, weight_NC, weight_ED, weight_ET], dtype=torch.float32).to(device)
+dice_loss = DiceLoss(to_onehot_y=False, softmax=False)
+dice_loss2 = DiceLoss(to_onehot_y=False, softmax=False)
+# dice_loss = DiceLoss(to_onehot_y=True, softmax=False)
+
+
+scaler = GradScaler()
+
+
+
+
+#refinement
+
+
+# def train_vae(autoencoder, cond_model, model, train_loader, train_dataset_len, optimizer, device):
+#     """
+#     Train the VAE model for one epoch with mixed precision.
+#     """
+#     model = model.to(device)
+#     #for epoch in range(n_epochs):
+#     model.train()
+#     scaler = GradScaler()
+#     epoch_loss = 0
+#     quantization_losses = 0
+#     # class_names = ["TC", "WT", "ET"]  # Names of the classes
+#     # Initialize dictionary to store sum of normalized losses
+#     class_losses_sum_overall_wo = {"BG":0, 'NC': 0, 'ED': 0, 'ET': 0}
+#     class_losses_sum_overall = {"BG":0, 'TC': 0, 'WT': 0, 'ET': 0}
+#     # class_losses_sum_overall = {"BG":0, 'NC': 0}
+#     batch_count = 0
+#     encodings_sumation = torch.zeros(1024).to(device)
+#     torch.autograd.set_detect_anomaly(True)
+#     for step, batch in enumerate(train_loader):
+#         # print("batch_count", batch_count)
+#         # batch_count += 1
+#         # print("step", step)
+#         # print("length of train loader", len(train_loader))
+        
+
+
+#         # print("Training in Progress")
+#         # mask = batch['mask'].to(device)
+#         images={}
+#         for key in ["t1n", "t2w", "t1c", "t2f"]:
+#             if key in batch:
+#                 images[key] = batch[key]
+#                 #print(f"image shape with modality {key} is", batch[key].shape)
+#             else:
+#                 raise KeyError(f"Key {key} not found in batch_data")  # Ensure key exists
+    
+#         # Stack modalities along the channel dimension (dim=1)
+#         images = torch.stack([images['t1n'], images['t2w'], images['t1c'], images['t2f']], dim=1)
+#         print("image shape with stacked modality is", images.shape)
+#         images = images.to(device)
+
+#         x_bot = cond_model(images)
+#         x_bot = torch.argmax(x_bot, dim=1)
+        
+#         embeddingsss = autoencoder.quantizer0.embed(x_bot)
+#         # z_quantized0_post = autoencoder.conv3(embeddingsss)
+#         # z_quantized0_post = autoencoder.conv4(z_quantized0_post)
+
+#         # Decoder path with skip connections
+#         reconstruction = autoencoder.decoder(embeddingsss)
+#         reconstruction = autoencoder.segmentation(reconstruction)
+
+        
+#         # Get the segmentation mask from batch_data
+#         if 'mask' in batch:
+#             mask = batch['mask']
+#             # print("image shape with seg_mask is", mask.shape)
+#         else:
+#             raise KeyError("Key 'segmentation' not found in batch_data") 
+        
+#         optimizer.zero_grad(set_to_none=True)
+#         # images = images.to(device)
+#         mask = mask.to(device)
+#         reconstruction = torch.argmax(reconstruction, dim=1)
+#         reconstruction = (reconstruction == 1) | (reconstruction == 3) | (reconstruction == 2)
+#         reconstruction = torch.tensor(reconstruction, dtype=torch.float32)
+
+#         mask_up = torch.unsqueeze(reconstruction, dim=1)
+#     # print("mask_up shape is", mask_up.shape)
+#         with autocast(device_type='cuda', enabled=False):
+            
+    
+#             # model outputs reconstruction and the quantization error
+#             # z_quantized_all, z_quantized0, z_quantized1, z_quantized2, z_quantized3, reconstruction, quantization_loss, encodings_sum, embedding0, embedding1, embedding2, embedding3= model(mask_up)
+
+#             z_quantized_all, reconstruction, quantization_loss, encodings_sum0, embedding0 = model(mask_up)
+            
+#             # z, reconstruction, quantization_loss, encodings_sum, embedding0= model(mask)
+#             # encodings_sum = encodings_sum.detach()
+#             # print("encodings_sum", encodings_sum.dtype)
+#             non_zero_count = torch.count_nonzero(encodings_sum0)
+#             print(f"Number of non-zero elements: {non_zero_count}")
+#             # print("embedding0 shape is", embedding0.shape)
+#             # print("embedding1 shape is", embedding1.shape)
+#             # print("embedding2 shape is", embedding2.shape)
+#             # print("embedding3 shape is", embedding3.shape)
+#             encodings_sumation += encodings_sum0
+
+#             # print("encodings_sumation", encodings_sumation)
+            
+#             # print("datatype of recon is", reconstruction.dtype)
+#             # print("reconstruction sum is", torch.sum(reconstruction))
+#             # reconstruction = reconstruction.to(torch.float32)
+#             # mask = mask.to(torch.float32)
+#             # print("datatype of recon is", reconstruction.dtype)
+#             # print("reconstruction sum is", torch.sum(reconstruction))
+#             quantization_loss = quantization_loss
+#             # print("Mask_sum is", torch.sum(mask))
+#             # Visualization at specified steps
+#             # norm_factor_BG = torch.sum(mask==0)
+
+#             # print("reconstruction.float()", reconstruction.shape)
+#             # norm_factor_BG = torch.sum(mask==0)
+#             # print("norm_factor_BG", norm_factor_BG)
+#             # norm_factor_NC = torch.sum(mask==1)
+#             # # print("norm_factor_NC", norm_factor_NC)
+#             # norm_factor_ED = torch.sum(mask==2)
+#             # # print("norm_factor_ED", norm_factor_ED)
+#             # norm_factor_EN = torch.sum(mask==3)
+#             # print("norm_factor_EN", norm_factor_EN)
+            
+    
+#             combined_loss = dice_loss(reconstruction, mask)
+#             # print("combined_loss shape is", combined_loss.shape)
+#             combined_loss = combined_loss.mean(dim=0)
+
+#             print(f"BG_loss_{combined_loss[0]}__________NC_loss_{combined_loss[1]}___________ED_loss_{combined_loss[2]}_____________ET_loss_{combined_loss[3]}")
+#             # print(f"BG_loss_{combined_loss[0]}__________NC_loss_{combined_loss[1]}")
+
+#             loss_BG = combined_loss[0]
+#             # class_losses_sum_overall+=
+#             # print("combined_loss shape is", combined_loss.shape)
+#             # print("combined_loss is", combined_loss)
+#             loss_NC = combined_loss[1]
+#             # print("loss_NC is", loss_NC.shape)
+#             # print("loss_NC is", loss_NC)
+#             # print("loss_NC is", loss_NC.item())
+#             loss_ED = combined_loss[2]
+#             # print("loss_ED is", loss_ED.shape)
+#             # print("loss_ED is", loss_ED)
+#             # print("loss_ED is", loss_ED.item())
+#             loss_EN = combined_loss[3]
+#             # print("loss_ED is", loss_EN.shape)
+#             # print("loss_ED is", loss_EN)
+#             # print("loss_ED is", loss_EN.item())
+
+#             # norm_BG = loss_BG*batch['mask'].shape[0]/norm_factor_BG
+
+#             # norm_NC = loss_NC*batch['mask'].shape[0]/norm_factor_NC
+#             # # print("norm_loss_NC is", norm_NC.item())
+#             # norm_ED = loss_ED*batch['mask'].shape[0]/norm_factor_ED
+#             # # print("norm_loss_EN is", norm_ED.item())
+#             # norm_EN = loss_EN*batch['mask'].shape[0]/norm_factor_EN
+#             # print("norm_loss_EN is", norm_EN.item())
+            
+
+#             # max_combined_loss = max(norm_NC, norm_ED, norm_EN)
+#             # norm_NC = (norm_NC+1e-4)/(max_combined_loss+1e-4)
+#             # norm_ED = (norm_ED+1e-4)/(max_combined_loss+1e-4)
+#             # norm_EN = (norm_EN+1e-4)/(max_combined_loss+1e-4)
+            
+            
+#             re_norm_combined_loss = ((loss_BG+loss_NC+loss_ED+loss_EN))
+#             print("re_norm_combined_loss", re_norm_combined_loss)
+
+            
+
+#             # min_normalized_losses= min(normalized_losses)
+#             # max_normalized_losses= max (normalized_losses)
+#             # combined_loss_up=0
+#             # for dice_los in normalized_losses:
+#             #     # print("dic_los", dice_los)
+#             #     dic_loss_update = (dice_los+1e-6)/(max_normalized_losses+1e-6)
+#             #     # print("dic_loss_update", dic_loss_update)
+#             #     combined_loss_up+=dic_loss_update
+#             # # print("combined_loss", combined_loss)
+#             # # num_voxels = mask.view(-1).numel()
+#             # # print(f"Total Voxels in the 3D Image: {num_voxels}")
+#             # # total_voxels=
+#             # combined_loss=combined_loss_up/3
+#             # # print("combined_loss", combined_loss)
+#             # # print("losses_dict", losses_dict)
+#             # # print("class_losses_sum", class_losses_sum)
+#             # # max_total_loss = max(combined_loss, quantization_loss)
+#             # # combined_loss = combined_loss/max_total_loss
+#             # print("dice_loss", combined_loss)
+#             # # quantization_loss = quantization_loss/max_total_loss
+#             print("quantization_losses is", quantization_loss)
+#             batch_images = batch['mask'].shape[0]
+
+
+#             for idx, (key, value) in enumerate(class_losses_sum_overall_wo.items()):
+#                 class_losses_sum_overall_wo[key]+=((combined_loss[idx].item())*batch_images)
+
+            
+#             mask = torch.argmax(mask, dim=1)
+#             # print("mask shape is", mask.shape)
+#             mask = [(mask == 0), (mask == 1) | (mask == 3), (mask == 1) | (mask == 3) | (mask == 2), (mask == 3)]
+#             mask = torch.stack(mask, dim=1).float()
+
+#             # print("Updated mask shape is", mask.shape)  # Should be (8, 4, 120, 120, 96)
+
+#             # mask = torch.stack(mask, dim=1).float()
+#             # print("mask shape is", mask.shape)
+#             # reconstruction = torch.softmax(reconstruction, 1)
+#             reconstruction = torch.argmax(reconstruction, dim=1)
+#             reconstruction = [(reconstruction == 0), (reconstruction == 1) | (reconstruction == 3), (reconstruction == 1) | (reconstruction == 3) | (reconstruction == 2), (reconstruction == 3)]
+#             reconstruction = torch.stack(reconstruction, dim=1).float()
+#             # print("reconstruction shape is", reconstruction.shape)
+#             combined_loss_bts = dice_loss(reconstruction, mask)
+#             combined_loss_bts = combined_loss_bts.mean(dim=0)
+
+#             print(f"BG_loss_{combined_loss_bts[0]}__________TC_loss_{combined_loss_bts[1]}___________WT_loss_{combined_loss_bts[2]}_____________ET_loss_{combined_loss_bts[3]}")
+#             for idx, (key, value) in enumerate(class_losses_sum_overall.items()):
+#                 class_losses_sum_overall[key]+=((combined_loss_bts[idx].item())*batch_images)
+#                 # print("class_losses_sum_overall", class_losses_sum_overall)
+            
+#             # # print("batch_images", batch_images)
+#             # for key, value in class_losses_sum_un.items():
+#             #     class_losses_sum_overall[key]+=value*batch_images
+#             # print("class_losses_sum_overall", class_losses_sum_overall)
+
+#             # combined_loss = l1_loss(reconstruction.float(), mask.float())
+            
+    
+#             loss = (re_norm_combined_loss + quantization_loss)
+#             print("total loss is", loss / 5)
+#             loss_tr = loss*batch_images
+#             quantization_loss=quantization_loss.item()*batch_images
+    
+#         scaler.scale(loss).backward()  # Scale loss and perform backward pass
+#         # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1)
+#         scaler.step(optimizer)  # Update model parameters
+#         scaler.update()
+    
+    
+#         epoch_loss += loss_tr.item()
+#         quantization_losses += quantization_loss
+
+#     for key, value in class_losses_sum_overall_wo.items():
+#         class_losses_sum_overall_wo[key] = value / train_dataset_len
+    
+#     for key, value in class_losses_sum_overall.items():
+#         class_losses_sum_overall[key] = value / train_dataset_len
+#     # Return the average loss over the epoch
+#     return z_quantized_all, epoch_loss / train_dataset_len, class_losses_sum_overall, class_losses_sum_overall_wo, quantization_losses/train_dataset_len, encodings_sumation
+
+
+
+# def validate_vae(autoencoder, cond_model, model, model_inferer, dataloader, val_dataset_len, device):
+#     """
+#     Validate the VAE model on the validation dataset.
+#     """
+#     print("Validation in Progress")
+#     # model = model.to(device)
+#     model.eval()  # Set the model to evaluation mode
+#     val_loss = 0  # Initialize total loss accumulator
+#     quantization_losses = 0
+#     class_losses_sum_overall_wo = {'BG': 0, 'NC': 0, 'ED': 0, 'ET': 0}
+#     class_losses_sum_overall = {'BG': 0, 'TC': 0, 'WT': 0, 'ET': 0}
+#     # class_losses_sum_overall = {'BG': 0, 'NC': 0}
+#     with torch.no_grad():  # Disable gradient computation for validation
+        
+#         for val_step, batch in enumerate(dataloader, start=1):
+            
+                       
+#             images={}
+#             for key in ["t1n", "t2w", "t1c", "t2f"]:
+#                 if key in batch:
+#                     images[key] = batch[key]
+#                     #print(f"image shape with modality {key} is", batch[key].shape)
+#                 else:
+#                     raise KeyError(f"Key {key} not found in batch_data")  # Ensure key exists
+        
+#             # Stack modalities along the channel dimension (dim=1)
+#             images = torch.stack([images['t1n'], images['t2w'], images['t1c'], images['t2f']], dim=1)
+#             print("image shape with stacked modality is", images.shape)
+#             images = images.to(device)
+    
+#             x_bot = cond_model(images)
+#             x_bot = torch.argmax(x_bot, dim=1)
+            
+#             embeddingsss = autoencoder.quantizer0.embed(x_bot)
+#             # z_quantized0_post = autoencoder.conv3(embeddingsss)
+#             # z_quantized0_post = autoencoder.conv4(z_quantized0_post)
+    
+#             # Decoder path with skip connections
+#             reconstruction = autoencoder.decoder(embeddingsss)
+#             reconstruction = autoencoder.segmentation(reconstruction)
+    
+            
+#             # Get the segmentation mask from batch_data
+#             if 'mask' in batch:
+#                 mask = batch['mask']
+#                 # print("image shape with seg_mask is", mask.shape)
+#             else:
+#                 raise KeyError("Key 'segmentation' not found in batch_data") 
+            
+#             optimizer.zero_grad(set_to_none=True)
+#             # images = images.to(device)
+#             mask = mask.to(device)
+#             reconstruction = torch.argmax(reconstruction, dim=1)
+#             reconstruction = (reconstruction == 1) | (reconstruction == 3) | (reconstruction == 2)
+#             reconstruction = torch.tensor(reconstruction, dtype=torch.float32)
+
+#             mask_up = torch.unsqueeze(reconstruction, dim=1)
+#             # print("mask_up shape is", mask_up.shape)
+#             with autocast(device_type='cuda', enabled=False):  # Mixed precision context for validation
+#                 # reconstruction_loss, quantization_loss = custom_sliding_window_inference(mask, model, (120, 120, 80), 4, 0.5)                # reconstruction, quantization_loss = model_inferer(mask)  # Forward pass through the model
+#                 # # Visualization at specified steps
+#                 # # if (val_step + 1) % 2 == 0:
+#                 # #     # Visualize middle slice of the first sample in the batch
+#                 # #     d = mask.shape[2]
+#                 # #     mid_slice = d // 2     
+#                 # # #    viz.image(mask[0, 0, :, :, mid_slice].cpu().numpy(), opts=dict(title='Input Mask'))
+#                 # #     viz.image(reconstruction[0, 0, :, :, mid_slice].cpu().numpy(), opts=dict(title='Reconstruction'))
+#                 # z, z_quantized0, z_quantized1, z_quantized2, z_quantized3, reconstruction, quantization_loss, encodings_sum, embedding0, embedding1, embedding2, embedding3 = model(mask_up)
+#                 # autoencoder_latent=model.encoder(mask_up) 
+#                 # autoencoder_latent = model.bottleneck(autoencoder_latent)
+#                 # autoencoder_latent=model.conv1(autoencoder_latent) 
+#                 # autoencoder_latent=model.conv2(autoencoder_latent) 
+#                 # autoencoder_latent_indices=model.quantizer0.quantize(autoencoder_latent)
+#                 # embeddingsss = model.embed(autoencoder_latent_indices)
+#                 z_quantized_all, reconstruction, quantization_loss, encodings_sum0, embedding0 = model(mask_up)
+#                 if reconstruction.shape[4] > 155:
+#                     # print("256.shape", reconstruction.shape)
+#                     reconstruction = reconstruction[:, :, :, :, :-1]
+#                     # print("255.shape", reconstruction.shape)
+#                 # z, reconstruction, quantization_loss, encodings_sum, embedding0 = model(mask)
+#                 # print("datatype of recon is", reconstruction.dtype)
+#                 # print("reconstruction sum is", torch.sum(reconstruction))
+#                 # reconstruction = reconstruction.to(torch.float32)
+#                 # mask = mask.to(torch.float32)
+#                 # print("datatype of recon is", reconstruction.dtype)
+#                 # print("reconstruction sum is", torch.sum(reconstruction))
+#                 # quantization_loss = quantization_loss
+#                 # print("Mask_sum is", torch.sum(mask))
+#                 # Visualization at specified steps
+                
+#                 # print("reconstruction.float()", reconstruction.shape)
+                
+#                 # combined_loss = dice_loss(reconstruction, mask)
+
+#                 # min_normalized_losses= min(normalized_losses)
+#                 # max_normalized_losses= max (normalized_losses)
+#                 # combined_loss_up=0
+#                 # for dice_los in normalized_losses:
+#                 #     # print("dic_los", dice_los)
+#                 #     dic_loss_update = (dice_los+1e-6)/(max_normalized_losses+1e-6)
+#                 #     # print("dic_loss_update", dic_loss_update)
+#                 #     combined_loss_up+=dic_loss_update
+                
+#                 # combined_loss=combined_loss_up/3
+#                 norm_factor_BG = torch.sum(mask==0)
+#                 norm_factor_NC = torch.sum(mask==1)
+#                 # print("norm_factor_NC", norm_factor_NC)
+#                 # norm_factor_ED = torch.sum(mask==2)
+#                 # # print("norm_factor_ED", norm_factor_ED)
+#                 # norm_factor_EN = torch.sum(mask==3)
+#                 # print("norm_factor_EN", norm_factor_EN)
+#                 combined_loss = dice_loss(reconstruction, mask)
+#                 # print("combined_loss shape is", combined_loss.shape)
+#                 combined_loss = combined_loss.mean(dim=0)
+#                 print(f"BG_loss_{combined_loss[0]}_____________NC_loss_{combined_loss[1]}___________ED_loss_{combined_loss[2]}_____________ET_loss_{combined_loss[3]}")
+#                 # print(f"BG_loss_{combined_loss[0]}_____________NC_loss_{combined_loss[1]}")
+#                 # print("combined_loss shape is", combined_loss.shape)
+#                 # print("combined_loss is", combined_loss)
+#                 loss_BG = combined_loss[0]
+#                 loss_NC = combined_loss[1]
+#                 # print("loss_NC is", loss_NC.shape)
+#                 # print("loss_NC is", loss_NC)
+#                 # print("loss_NC is", loss_NC.item())
+#                 loss_ED = combined_loss[2]
+#                 # # print("loss_ED is", loss_ED.shape)
+#                 # # print("loss_ED is", loss_ED)
+#                 # # print("loss_ED is", loss_ED.item())
+#                 loss_EN = combined_loss[3]
+#                 # print("loss_ED is", loss_EN.shape)
+#                 # print("loss_ED is", loss_EN)
+#                 # print("loss_ED is", loss_EN.item())
+#                 # norm_BG = loss_BG*batch['mask'].shape[0]/norm_factor_BG
+#                 # norm_NC = loss_NC*batch['mask'].shape[0]/norm_factor_NC
+#                 # print("norm_loss_NC is", norm_NC.item())
+#                 # norm_ED = loss_ED*batch['mask'].shape[0]/norm_factor_ED
+#                 # # print("norm_loss_EN is", norm_ED.item())
+#                 # norm_EN = loss_EN*batch['mask'].shape[0]/norm_factor_EN
+#                 # print("norm_loss_EN is", norm_EN.item())
+                
+    
+#                 # max_combined_loss = max(norm_NC, norm_ED, norm_EN)
+#                 # norm_NC = (norm_NC+1e-4)/(max_combined_loss+1e-4)
+#                 # norm_ED = (norm_ED+1e-4)/(max_combined_loss+1e-4)
+#                 # norm_EN = (norm_EN+1e-4)/(max_combined_loss+1e-4)
+                
+#                 quantization_loss = quantization_loss
+#                 re_norm_combined_loss = ((loss_BG+loss_NC+loss_ED+loss_EN))
+#                 # print("re_norm_combined_loss", re_norm_combined_loss)
+                    
+#                 # print("combined_loss", combined_loss)
+#                 # # quantization_loss = quantization_loss/max_total_loss
+#                 # # print("quantization_losses is", quantization_loss)
+#                 batch_images = batch['mask'].shape[0]
+
+#                 mask = torch.argmax(mask, dim=1)
+#                 mask = [(mask == 0), (mask == 1) | (mask == 3), (mask == 1) | (mask == 3) | (mask == 2), (mask == 3)]
+#                 mask = torch.stack(mask, dim=1).float()
+
+#                 print("Updated mask shape is", mask.shape)  # Should be (8, 4, 120, 120, 96)
+
+#                 # mask = torch.stack(mask, dim=1).float()
+#                 # print("mask shape is", mask.shape)
+#                 # reconstruction = torch.softmax(reconstruction, 1)
+#                 reconstruction = torch.argmax(reconstruction, dim=1)
+#                 reconstruction = [(reconstruction == 0), (reconstruction == 1) | (reconstruction == 3), (reconstruction == 1) | (reconstruction == 3) | (reconstruction == 2), (reconstruction == 3)]
+#                 reconstruction = torch.stack(reconstruction, dim=1).float()
+#                 print("reconstruction shape is", reconstruction.shape)
+#                 combined_loss_bts = dice_loss(reconstruction, mask)
+#                 combined_loss_bts = combined_loss_bts.mean(dim=0)
+    
+#                 print(f"BG_loss_{combined_loss_bts[0]}__________TC_loss_{combined_loss_bts[1]}___________WT_loss_{combined_loss_bts[2]}_____________ET_loss_{combined_loss_bts[3]}")
+
+#                 for idx, (key, value) in enumerate(class_losses_sum_overall_wo.items()):
+#                     class_losses_sum_overall_wo[key]+=((combined_loss[idx].item())*batch_images)
+
+#                 for idx, (key, value) in enumerate(class_losses_sum_overall.items()):
+#                     class_losses_sum_overall[key]+=((combined_loss_bts[idx].item())*batch_images)
+#                 # print("class_losses_sum_overall", class_losses_sum_overall)
+                
+#                 # # # print("batch_images", batch_images)
+#                 # print("class_losses_sum_overall", class_losses_sum_overall)
+                
+#                 # combined_loss = l1_loss(reconstruction.float(), mask.float())
+#                 loss = (re_norm_combined_loss + quantization_loss)
+#                 print("total loss is", loss / 5)
+#                 loss_val = loss*batch_images
+#                 quantization_loss=quantization_loss.item()*batch_images
+                
+    
+
+    
+            
+#             val_loss += loss_val.item()  # Accumulate the loss value
+#             quantization_losses += quantization_loss
+
+#     for key, value in class_losses_sum_overall_wo.items():
+#         class_losses_sum_overall_wo[key] = value / val_dataset_len
+
+    
+#     for key, value in class_losses_sum_overall.items():
+#         class_losses_sum_overall[key] = value / val_dataset_len
+
+#     # Return the average loss over the validation dataset
+#     return mask, reconstruction, z_quantized_all, val_loss / val_dataset_len, class_losses_sum_overall, class_losses_sum_overall_wo, quantization_losses/val_dataset_len, embedding0
+
+
+
+def train_vae(model, train_loader, train_dataset_len, optimizer, device):
+    """
+    Train the VAE model for one epoch with mixed precision.
+    """
+    model = model.to(device)
+    #for epoch in range(n_epochs):
+    model.train()
+    scaler = GradScaler()
+    epoch_loss = 0
+    quantization_losses = 0
+    # class_names = ["TC", "WT", "ET"]  # Names of the classes
+    # Initialize dictionary to store sum of normalized losses
+    class_losses_sum_overall_wo = {"BG":0, 'NC': 0, 'ED': 0, 'ET': 0}
+    class_losses_sum_overall = {"BG":0, 'TC': 0, 'WT': 0, 'ET': 0}
+    # class_losses_sum_overall = {"BG":0, 'NC': 0}
+    batch_count = 0
+    encodings_sumation = torch.zeros(512).to(device)
+    torch.autograd.set_detect_anomaly(True)
+    for step, batch in enumerate(train_loader):
+        # print("batch_count", batch_count)
+        # batch_count += 1
+        # print("step", step)
+        # print("length of train loader", len(train_loader))
+        
+
+
+        # print("Training in Progress")
+        # mask = batch['mask'].to(device)
+        # images={}
+        # for key in ["t1n", "t2w", "t1c", "t2f"]:
+        #     if key in batch:
+        #         images[key] = batch[key]
+        #         #print(f"image shape with modality {key} is", batch[key].shape)
+        #     else:
+        #         raise KeyError(f"Key {key} not found in batch_data")  # Ensure key exists
+    
+        # # Stack modalities along the channel dimension (dim=1)
+        # images = torch.stack([images['t1n'], images['t2w'], images['t1c'], images['t2f']], dim=1)
+        # print("image shape with stacked modality is", images.shape)
+        
+        # Get the segmentation mask from batch_data
+        if 'mask' in batch:
+            mask = batch['mask']
+            # print("image shape with seg_mask is", mask.shape)
+        else:
+            raise KeyError("Key 'segmentation' not found in batch_data") 
+        
+        optimizer.zero_grad(set_to_none=True)
+        # images = images.to(device)
+        mask = mask.to(device)
+        # print("mask shape is", mask.shape)
+        mask_up = mask[:, 1:, :, :, :]
+        # print("mask_up shape is", mask_up.shape)
+        with autocast(device_type='cuda', enabled=False):
+            
+    
+            # model outputs reconstruction and the quantization error
+            # z_quantized_all, z_quantized0, z_quantized1, z_quantized2, z_quantized3, reconstruction, quantization_loss, encodings_sum, embedding0, embedding1, embedding2, embedding3= model(mask_up)
+
+            z_quantized_all, reconstruction, quantization_loss, encodings_sum0, embedding0 = model(mask_up)
+            
+            # z, reconstruction, quantization_loss, encodings_sum, embedding0= model(mask)
+            # encodings_sum = encodings_sum.detach()
+            # print("encodings_sum", encodings_sum.dtype)
+            non_zero_count = torch.count_nonzero(encodings_sum0)
+            print(f"Number of non-zero elements: {non_zero_count}")
+            # print("embedding0 shape is", embedding0.shape)
+            # print("embedding1 shape is", embedding1.shape)
+            # print("embedding2 shape is", embedding2.shape)
+            # print("embedding3 shape is", embedding3.shape)
+            encodings_sumation += encodings_sum0
+
+            # print("encodings_sumation", encodings_sumation)
+            
+            # print("datatype of recon is", reconstruction.dtype)
+            # print("reconstruction sum is", torch.sum(reconstruction))
+            # reconstruction = reconstruction.to(torch.float32)
+            # mask = mask.to(torch.float32)
+            # print("datatype of recon is", reconstruction.dtype)
+            # print("reconstruction sum is", torch.sum(reconstruction))
+            quantization_loss = quantization_loss
+            # print("Mask_sum is", torch.sum(mask))
+            # Visualization at specified steps
+            # norm_factor_BG = torch.sum(mask==0)
+
+            # print("reconstruction.float()", reconstruction.shape)
+            # norm_factor_BG = torch.sum(mask==0)
+            # print("norm_factor_BG", norm_factor_BG)
+            # norm_factor_NC = torch.sum(mask==1)
+            # # print("norm_factor_NC", norm_factor_NC)
+            # norm_factor_ED = torch.sum(mask==2)
+            # # print("norm_factor_ED", norm_factor_ED)
+            # norm_factor_EN = torch.sum(mask==3)
+            # print("norm_factor_EN", norm_factor_EN)
+            
+    
+            combined_loss = dice_loss(reconstruction, mask)
+            # print("combined_loss shape is", combined_loss.shape)
+            combined_loss = combined_loss.mean(dim=0)
+
+            print(f"BG_loss_{combined_loss[0]}__________NC_loss_{combined_loss[1]}___________ED_loss_{combined_loss[2]}_____________ET_loss_{combined_loss[3]}")
+            # print(f"BG_loss_{combined_loss[0]}__________NC_loss_{combined_loss[1]}")
+
+            loss_BG = combined_loss[0]
+            # class_losses_sum_overall+=
+            # print("combined_loss shape is", combined_loss.shape)
+            # print("combined_loss is", combined_loss)
+            loss_NC = combined_loss[1]
+            # print("loss_NC is", loss_NC.shape)
+            # print("loss_NC is", loss_NC)
+            # print("loss_NC is", loss_NC.item())
+            loss_ED = combined_loss[2]
+            # print("loss_ED is", loss_ED.shape)
+            # print("loss_ED is", loss_ED)
+            # print("loss_ED is", loss_ED.item())
+            loss_EN = combined_loss[3]
+            # print("loss_ED is", loss_EN.shape)
+            # print("loss_ED is", loss_EN)
+            # print("loss_ED is", loss_EN.item())
+
+            # norm_BG = loss_BG*batch['mask'].shape[0]/norm_factor_BG
+
+            # norm_NC = loss_NC*batch['mask'].shape[0]/norm_factor_NC
+            # # print("norm_loss_NC is", norm_NC.item())
+            # norm_ED = loss_ED*batch['mask'].shape[0]/norm_factor_ED
+            # # print("norm_loss_EN is", norm_ED.item())
+            # norm_EN = loss_EN*batch['mask'].shape[0]/norm_factor_EN
+            # print("norm_loss_EN is", norm_EN.item())
+            
+
+            # max_combined_loss = max(norm_NC, norm_ED, norm_EN)
+            # norm_NC = (norm_NC+1e-4)/(max_combined_loss+1e-4)
+            # norm_ED = (norm_ED+1e-4)/(max_combined_loss+1e-4)
+            # norm_EN = (norm_EN+1e-4)/(max_combined_loss+1e-4)
+            
+            
+            re_norm_combined_loss = ((loss_BG+loss_NC+loss_ED+loss_EN))
+            print("re_norm_combined_loss", re_norm_combined_loss)
+
+            
+
+            # min_normalized_losses= min(normalized_losses)
+            # max_normalized_losses= max (normalized_losses)
+            # combined_loss_up=0
+            # for dice_los in normalized_losses:
+            #     # print("dic_los", dice_los)
+            #     dic_loss_update = (dice_los+1e-6)/(max_normalized_losses+1e-6)
+            #     # print("dic_loss_update", dic_loss_update)
+            #     combined_loss_up+=dic_loss_update
+            # # print("combined_loss", combined_loss)
+            # # num_voxels = mask.view(-1).numel()
+            # # print(f"Total Voxels in the 3D Image: {num_voxels}")
+            # # total_voxels=
+            # combined_loss=combined_loss_up/3
+            # # print("combined_loss", combined_loss)
+            # # print("losses_dict", losses_dict)
+            # # print("class_losses_sum", class_losses_sum)
+            # # max_total_loss = max(combined_loss, quantization_loss)
+            # # combined_loss = combined_loss/max_total_loss
+            # print("dice_loss", combined_loss)
+            # # quantization_loss = quantization_loss/max_total_loss
+            print("quantization_losses is", quantization_loss)
+            batch_images = batch['mask'].shape[0]
+
+
+            for idx, (key, value) in enumerate(class_losses_sum_overall_wo.items()):
+                class_losses_sum_overall_wo[key]+=((combined_loss[idx].item())*batch_images)
+
+            
+            mask = torch.argmax(mask, dim=1)
+            # print("mask shape is", mask.shape)
+            mask = [(mask == 0), (mask == 1) | (mask == 3), (mask == 1) | (mask == 3) | (mask == 2), (mask == 3)]
+            mask = torch.stack(mask, dim=1).float()
+
+            # print("Updated mask shape is", mask.shape)  # Should be (8, 4, 120, 120, 96)
+
+            # mask = torch.stack(mask, dim=1).float()
+            # print("mask shape is", mask.shape)
+            # reconstruction = torch.softmax(reconstruction, 1)
+            reconstruction = torch.argmax(reconstruction, dim=1)
+            reconstruction = [(reconstruction == 0), (reconstruction == 1) | (reconstruction == 3), (reconstruction == 1) | (reconstruction == 3) | (reconstruction == 2), (reconstruction == 3)]
+            reconstruction = torch.stack(reconstruction, dim=1).float()
+            # print("reconstruction shape is", reconstruction.shape)
+            combined_loss_bts = dice_loss(reconstruction, mask)
+            combined_loss_bts = combined_loss_bts.mean(dim=0)
+
+            print(f"BG_loss_{combined_loss_bts[0]}__________TC_loss_{combined_loss_bts[1]}___________WT_loss_{combined_loss_bts[2]}_____________ET_loss_{combined_loss_bts[3]}")
+            for idx, (key, value) in enumerate(class_losses_sum_overall.items()):
+                class_losses_sum_overall[key]+=((combined_loss_bts[idx].item())*batch_images)
+                # print("class_losses_sum_overall", class_losses_sum_overall)
+            
+            # # print("batch_images", batch_images)
+            # for key, value in class_losses_sum_un.items():
+            #     class_losses_sum_overall[key]+=value*batch_images
+            # print("class_losses_sum_overall", class_losses_sum_overall)
+
+            # combined_loss = l1_loss(reconstruction.float(), mask.float())
+            
+    
+            loss = (re_norm_combined_loss + quantization_loss)
+            print("total loss is", loss / 5)
+            loss_tr = loss*batch_images
+            quantization_loss=quantization_loss.item()*batch_images
+    
+        scaler.scale(loss).backward()  # Scale loss and perform backward pass
+        # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1)
+        scaler.step(optimizer)  # Update model parameters
+        scaler.update()
+    
+    
+        epoch_loss += loss_tr.item()
+        quantization_losses += quantization_loss
+
+    for key, value in class_losses_sum_overall_wo.items():
+        class_losses_sum_overall_wo[key] = value / train_dataset_len
+    
+    for key, value in class_losses_sum_overall.items():
+        class_losses_sum_overall[key] = value / train_dataset_len
+    # Return the average loss over the epoch
+    return z_quantized_all, epoch_loss / train_dataset_len, class_losses_sum_overall, class_losses_sum_overall_wo, quantization_losses/train_dataset_len, encodings_sumation
+
+
+
+def validate_vae(model, model_inferer, dataloader, val_dataset_len, device):
+    """
+    Validate the VAE model on the validation dataset.
+    """
+    print("Validation in Progress")
+    # model = model.to(device)
+    model.eval()  # Set the model to evaluation mode
+    val_loss = 0  # Initialize total loss accumulator
+    quantization_losses = 0
+    class_losses_sum_overall_wo = {'BG': 0, 'NC': 0, 'ED': 0, 'ET': 0}
+    class_losses_sum_overall = {'BG': 0, 'TC': 0, 'WT': 0, 'ET': 0}
+    # class_losses_sum_overall = {'BG': 0, 'NC': 0}
+    with torch.no_grad():  # Disable gradient computation for validation
+        
+        for val_step, batch in enumerate(dataloader, start=1):
+            
+                       
+            # images={}
+            # for key in ["t1n", "t2w", "t1c", "t2f"]:
+            #     if key in batch:
+            #         images[key] = batch[key]
+            #        # print(f"image shape with modality {key} is", batch[key].shape)
+            #     else:
+            #         raise KeyError(f"Key {key} not found in batch_data")  # Ensure key exists
+        
+            # # Stack modalities along the channel dimension (dim=1)
+            # images = torch.stack([images['t1n'], images['t2w'], images['t1c'], images['t2f']], dim=1)
+            # print("image shape with stacked modality is", images.shape)
+            
+            # Get the segmentation mask from batch_data
+            if 'mask' in batch:
+                mask = batch['mask']
+                # print("image shape with seg_mask is", mask.shape)
+            else:
+                raise KeyError("Key 'segmentation' not found in batch_data") 
+
+            # images = images.to(device)
+            mask = mask.to(device)
+            mask_up = mask[:,1:,:,:,:]
+            with autocast(device_type='cuda', enabled=False):  # Mixed precision context for validation
+                # reconstruction_loss, quantization_loss = custom_sliding_window_inference(mask, model, (120, 120, 80), 4, 0.5)                # reconstruction, quantization_loss = model_inferer(mask)  # Forward pass through the model
+                # # Visualization at specified steps
+                # # if (val_step + 1) % 2 == 0:
+                # #     # Visualize middle slice of the first sample in the batch
+                # #     d = mask.shape[2]
+                # #     mid_slice = d // 2     
+                # # #    viz.image(mask[0, 0, :, :, mid_slice].cpu().numpy(), opts=dict(title='Input Mask'))
+                # #     viz.image(reconstruction[0, 0, :, :, mid_slice].cpu().numpy(), opts=dict(title='Reconstruction'))
+                # z, z_quantized0, z_quantized1, z_quantized2, z_quantized3, reconstruction, quantization_loss, encodings_sum, embedding0, embedding1, embedding2, embedding3 = model(mask_up)
+                # autoencoder_latent=model.encoder(mask_up) 
+                # autoencoder_latent = model.bottleneck(autoencoder_latent)
+                # autoencoder_latent=model.conv1(autoencoder_latent) 
+                # autoencoder_latent=model.conv2(autoencoder_latent) 
+                # autoencoder_latent_indices=model.quantizer0.quantize(autoencoder_latent)
+                # embeddingsss = model.embed(autoencoder_latent_indices)
+                z_quantized_all, reconstruction, quantization_loss, encodings_sum0, embedding0 = model(mask_up)
+                if reconstruction.shape[4] > 155:
+                    # print("256.shape", reconstruction.shape)
+                    reconstruction = reconstruction[:, :, :, :, :-1]
+                    # print("255.shape", reconstruction.shape)
+                # z, reconstruction, quantization_loss, encodings_sum, embedding0 = model(mask)
+                # print("datatype of recon is", reconstruction.dtype)
+                # print("reconstruction sum is", torch.sum(reconstruction))
+                # reconstruction = reconstruction.to(torch.float32)
+                # mask = mask.to(torch.float32)
+                # print("datatype of recon is", reconstruction.dtype)
+                # print("reconstruction sum is", torch.sum(reconstruction))
+                # quantization_loss = quantization_loss
+                # print("Mask_sum is", torch.sum(mask))
+                # Visualization at specified steps
+                
+                # print("reconstruction.float()", reconstruction.shape)
+                
+                # combined_loss = dice_loss(reconstruction, mask)
+
+                # min_normalized_losses= min(normalized_losses)
+                # max_normalized_losses= max (normalized_losses)
+                # combined_loss_up=0
+                # for dice_los in normalized_losses:
+                #     # print("dic_los", dice_los)
+                #     dic_loss_update = (dice_los+1e-6)/(max_normalized_losses+1e-6)
+                #     # print("dic_loss_update", dic_loss_update)
+                #     combined_loss_up+=dic_loss_update
+                
+                # combined_loss=combined_loss_up/3
+                norm_factor_BG = torch.sum(mask==0)
+                norm_factor_NC = torch.sum(mask==1)
+                # print("norm_factor_NC", norm_factor_NC)
+                # norm_factor_ED = torch.sum(mask==2)
+                # # print("norm_factor_ED", norm_factor_ED)
+                # norm_factor_EN = torch.sum(mask==3)
+                # print("norm_factor_EN", norm_factor_EN)
+                combined_loss = dice_loss(reconstruction, mask)
+                # print("combined_loss shape is", combined_loss.shape)
+                combined_loss = combined_loss.mean(dim=0)
+                print(f"BG_loss_{combined_loss[0]}_____________NC_loss_{combined_loss[1]}___________ED_loss_{combined_loss[2]}_____________ET_loss_{combined_loss[3]}")
+                # print(f"BG_loss_{combined_loss[0]}_____________NC_loss_{combined_loss[1]}")
+                # print("combined_loss shape is", combined_loss.shape)
+                # print("combined_loss is", combined_loss)
+                loss_BG = combined_loss[0]
+                loss_NC = combined_loss[1]
+                # print("loss_NC is", loss_NC.shape)
+                # print("loss_NC is", loss_NC)
+                # print("loss_NC is", loss_NC.item())
+                loss_ED = combined_loss[2]
+                # # print("loss_ED is", loss_ED.shape)
+                # # print("loss_ED is", loss_ED)
+                # # print("loss_ED is", loss_ED.item())
+                loss_EN = combined_loss[3]
+                # print("loss_ED is", loss_EN.shape)
+                # print("loss_ED is", loss_EN)
+                # print("loss_ED is", loss_EN.item())
+                # norm_BG = loss_BG*batch['mask'].shape[0]/norm_factor_BG
+                # norm_NC = loss_NC*batch['mask'].shape[0]/norm_factor_NC
+                # print("norm_loss_NC is", norm_NC.item())
+                # norm_ED = loss_ED*batch['mask'].shape[0]/norm_factor_ED
+                # # print("norm_loss_EN is", norm_ED.item())
+                # norm_EN = loss_EN*batch['mask'].shape[0]/norm_factor_EN
+                # print("norm_loss_EN is", norm_EN.item())
+                
+    
+                # max_combined_loss = max(norm_NC, norm_ED, norm_EN)
+                # norm_NC = (norm_NC+1e-4)/(max_combined_loss+1e-4)
+                # norm_ED = (norm_ED+1e-4)/(max_combined_loss+1e-4)
+                # norm_EN = (norm_EN+1e-4)/(max_combined_loss+1e-4)
+                
+                quantization_loss = quantization_loss
+                re_norm_combined_loss = ((loss_BG+loss_NC+loss_ED+loss_EN))
+                # print("re_norm_combined_loss", re_norm_combined_loss)
+                    
+                # print("combined_loss", combined_loss)
+                # # quantization_loss = quantization_loss/max_total_loss
+                # # print("quantization_losses is", quantization_loss)
+                batch_images = batch['mask'].shape[0]
+
+                mask = torch.argmax(mask, dim=1)
+                mask = [(mask == 0), (mask == 1) | (mask == 3), (mask == 1) | (mask == 3) | (mask == 2), (mask == 3)]
+                mask = torch.stack(mask, dim=1).float()
+
+                print("Updated mask shape is", mask.shape)  # Should be (8, 4, 120, 120, 96)
+
+                # mask = torch.stack(mask, dim=1).float()
+                # print("mask shape is", mask.shape)
+                # reconstruction = torch.softmax(reconstruction, 1)
+                reconstruction = torch.argmax(reconstruction, dim=1)
+                reconstruction = [(reconstruction == 0), (reconstruction == 1) | (reconstruction == 3), (reconstruction == 1) | (reconstruction == 3) | (reconstruction == 2), (reconstruction == 3)]
+                reconstruction = torch.stack(reconstruction, dim=1).float()
+                print("reconstruction shape is", reconstruction.shape)
+                combined_loss_bts = dice_loss(reconstruction, mask)
+                combined_loss_bts = combined_loss_bts.mean(dim=0)
+    
+                print(f"BG_loss_{combined_loss_bts[0]}__________TC_loss_{combined_loss_bts[1]}___________WT_loss_{combined_loss_bts[2]}_____________ET_loss_{combined_loss_bts[3]}")
+
+                for idx, (key, value) in enumerate(class_losses_sum_overall_wo.items()):
+                    class_losses_sum_overall_wo[key]+=((combined_loss[idx].item())*batch_images)
+
+                for idx, (key, value) in enumerate(class_losses_sum_overall.items()):
+                    class_losses_sum_overall[key]+=((combined_loss_bts[idx].item())*batch_images)
+                # print("class_losses_sum_overall", class_losses_sum_overall)
+                
+                # # # print("batch_images", batch_images)
+                # print("class_losses_sum_overall", class_losses_sum_overall)
+                
+                # combined_loss = l1_loss(reconstruction.float(), mask.float())
+                loss = (re_norm_combined_loss + quantization_loss)
+                print("total loss is", loss / 5)
+                loss_val = loss*batch_images
+                quantization_loss=quantization_loss.item()*batch_images
+                
+    
+
+    
+            
+            val_loss += loss_val.item()  # Accumulate the loss value
+            quantization_losses += quantization_loss
+
+    for key, value in class_losses_sum_overall_wo.items():
+        class_losses_sum_overall_wo[key] = value / val_dataset_len
+
+    
+    for key, value in class_losses_sum_overall.items():
+        class_losses_sum_overall[key] = value / val_dataset_len
+
+    # Return the average loss over the validation dataset
+    return mask, reconstruction, z_quantized_all, val_loss / val_dataset_len, class_losses_sum_overall, class_losses_sum_overall_wo, quantization_losses/val_dataset_len, embedding0
+
+
+
+
+def test_vae(model, dataloader, device, test_dataset_len, output_dir):
+    """
+    Validate the VAE model on the validation dataset.
+    """
+    print("Validation in Progress")
+    print(device)
+    model = model.to(device)
+    model.eval()  # Set the model to evaluation mode
+    test_loss = 0  # Initialize total loss accumulator
+    class_losses_sum_overall_wo = {'BG': 0, 'NC': 0, 'ED': 0, 'ET': 0}
+    class_losses_sum_overall = {'BG': 0, 'TC': 0, 'WT': 0, 'ET': 0}
+    
+    with torch.no_grad():  # Disable gradient computation for validation
+        for test_step, batch in enumerate(dataloader, start=1):
+            
+                       
+            images={}
+            for key in ["t1n", "t2w", "t1c", "t2f"]:
+                if key in batch:
+                    images[key] = batch[key]
+                   # print(f"image shape with modality {key} is", batch[key].shape)
+                else:
+                    raise KeyError(f"Key {key} not found in batch_data")  # Ensure key exists
+        
+            # Stack modalities along the channel dimension (dim=1)
+            images = torch.stack([images['t1n'], images['t2w'], images['t1c'], images['t2f']], dim=1)
+            # print("image shape with stacked modality is", images.shape)
+            
+            # Get the segmentation mask from batch_data
+            if 'mask' in batch:
+                mask = batch['mask']
+                # print("image shape with seg_mask is", mask.shape)
+            else:
+                raise KeyError("Key 'segmentation' not found in batch_data") 
+
+            print(torch.cuda.is_available())
+
+            images = images.to(device)
+            mask = mask.to(device)
+            mask_up = mask[:,1:,:,:,:]
+            print(torch.cuda.is_available())
+            with autocast(device_type='cuda', enabled=False):  # Mixed precision context for validation
+                # reconstruction_all, reconstruction_loss, quantization_loss = test_custom_sliding_window_inference(mask, model, (120, 120, 80), 4, 0.5) 
+                
+                # z, reconstruction_all, quantization_loss, summm, embedding0 = model(mask)
+
+                enc=model.encoder(mask_up)
+                enc=model.bottleneck(enc)
+                enc=model.conv1(enc)
+                enc=model.conv2(enc)
+                quantized = model.quantizer0.quantize(enc)
+                
+                quantized = model.quantizer0.embed(quantized)
+                quantized=model.conv3(quantized)
+                quantized=model.conv4(quantized)
+                quantized=model.decoder(quantized)
+                reconstruction_all=model.segmentation(quantized)
+
+                
+                # z, reconstruction_all, quantization_loss, summm, embedding0 = model(mask_up)
+                if reconstruction_all.shape[4] > 155:
+                    # print("256.shape", reconstruction.shape)
+                    reconstruction_all = reconstruction_all[:, :, :, :, :-1]
+                # reconstruction_loss = dice_loss(reconstruction_all.float(), mask.float())
+                # if reconstruction_all.shape[4] > 155:
+                #     # print("256.shape", reconstruction.shape)
+                #     reconstruction_all = reconstruction_all[:, :, :, :, :-1]
+
+                # if reconstruction_all.shape[4] < 155:
+                #     # print("256.shape", reconstruction.shape)
+                #     reconstruction_all = F.pad(reconstruction_all, (0, 3, 0, 0, 0, 0), mode='constant', value=0)
+                reconstruction_all=reconstruction_all.to(torch.float32)
+                mask = mask.to(torch.float32)
+                print("reconstruction_al", reconstruction_all.shape)
+
+                norm_factor_BG = torch.sum(mask[:,0,:,:,:])
+                print("norm_factor_BG", norm_factor_BG)
+                norm_factor_NC = torch.sum(mask[:,1,:,:,:])
+                print("norm_factor_NC", norm_factor_NC/1)
+                norm_factor_ED = torch.sum(mask[:,2,:,:,:])
+                print("norm_factor_ED", norm_factor_ED)
+                norm_factor_EN = torch.sum(mask[:,3,:,:,:])
+                print("norm_factor_EN", norm_factor_EN)
+        
+                combined_loss = dice_loss(reconstruction_all, mask)
+                # print("combined_loss shape is", combined_loss.shape)
+                combined_loss = combined_loss.mean(dim=0)
+                print(f"BG_loss_{combined_loss[0]}_____________NC_loss_{combined_loss[1]}___________ED_loss_{combined_loss[2]}_____________EN_loss_{combined_loss[3]}")
+                # print("combined_loss shape is", combined_loss.shape)
+                # print("combined_loss is", combined_loss)
+                loss_BG = combined_loss[0]
+                loss_NC = combined_loss[1]
+                # print("loss_NC is", loss_NC.shape)
+                # print("loss_NC is", loss_NC)
+                # print("loss_NC is", loss_NC.item())
+                loss_ED = combined_loss[2]
+                # print("loss_ED is", loss_ED.shape)
+                # print("loss_ED is", loss_ED)
+                # print("loss_ED is", loss_ED.item())
+                loss_EN = combined_loss[3]
+                # print("loss_ED is", loss_EN.shape)
+                # print("loss_ED is", loss_EN)
+                # print("loss_ED is", loss_EN.item())
+    
+                norm_NC = loss_NC*batch['mask'].shape[0]/norm_factor_NC
+                # print("norm_loss_NC is", norm_NC.item())
+                norm_ED = loss_ED*batch['mask'].shape[0]/norm_factor_ED
+                # print("norm_loss_EN is", norm_ED.item())
+                norm_EN = loss_EN*batch['mask'].shape[0]/norm_factor_EN
+                # print("norm_loss_EN is", norm_EN.item())
+                
+    
+                # max_combined_loss = max(norm_NC, norm_ED, norm_EN)
+                # norm_NC = (norm_NC+1e-4)/(max_combined_loss+1e-4)
+                # norm_ED = (norm_ED+1e-4)/(max_combined_loss+1e-4)
+                # norm_EN = (norm_EN+1e-4)/(max_combined_loss+1e-4)
+                
+                
+                re_norm_combined_loss = ((loss_BG+loss_NC+loss_ED+loss_EN))
+                # print("re_norm_combined_loss", re_norm_combined_loss)
+                    
+                # print("combined_loss", combined_loss)
+                # # quantization_loss = quantization_loss/max_total_loss
+                # # print("quantization_losses is", quantization_loss)
+                batch_images = batch['mask'].shape[0]
+
+                # for idx, (key, value) in enumerate(class_losses_sum_overall.items()):
+                #     class_losses_sum_overall[key]+=((combined_loss[idx].item())*batch_images)
+                # # print("class_losses_sum_overall", class_losses_sum_overall)
+                
+                # # # # print("batch_images", batch_images)
+                # for key, value in class_losses_sum_overall.items():
+                #     class_losses_sum_overall[key] = value / val_dataset_len
+                # print("class_losses_sum_overall", class_losses_sum_overall)
+                
+                # combined_loss = l1_loss(reconstruction.float(), mask.float())
+                loss = (re_norm_combined_loss + 0)
+                print("total loss is", loss)
+                # loss_val = loss*batch_images
+                
+
+                # reconstruction_all = reconstruction_all.squeeze().cpu().numpy()
+                # print("reconstruction_al", reconstruction_all.shape)
+                # reconstruction_all = nib.Nifti1Image(reconstruction_all, affine=np.eye(4))
+                # nib.save(reconstruction_all, os.path.join(output_dir, f'reconstructed_all_image_{test_step}.nii.gz'))
+
+                # mask = mask.squeeze().cpu().numpy()
+                # print("mask", mask.shape)
+                # mask = nib.Nifti1Image(mask, affine=np.eye(4))
+                # nib.save(mask, os.path.join(output_dir, f'mask_all_image_{test_step}.nii.gz'))
+                
+                # reconstruction, quantization_loss = model_inferer(mask)  # Forward pass through the model
+                # # Visualization at specified steps
+                # # if (val_step + 1) % 2 == 0:
+                # #     # Visualize middle slice of the first sample in the batch
+                # #     d = mask.shape[2]
+                # #     mid_slice = d // 2     
+                # # #    viz.image(mask[0, 0, :, :, mid_slice].cpu().numpy(), opts=dict(title='Input Mask'))
+                # #     viz.image(reconstruction[0, 0, :, :, mid_slice].cpu().numpy(), opts=dict(title='Reconstruction'))
+
+                # class_losses_sum, class_losses_sum_un, normalized_losses = compute_normalized_dice_loss(reconstruction.float(), mask.float())
+
+                # min_normalized_losses= min(normalized_losses)
+                # max_normalized_losses= max (normalized_losses)
+                # combined_loss_up=0
+                # for dice_los in normalized_losses:
+                #     # print("dic_los", dice_los)
+                #     dic_loss_update = (dice_los+1e-6)/(max_normalized_losses+1e-6)
+                #     # print("dic_loss_update", dic_loss_update)
+                #     combined_loss_up+=dic_loss_update
+                
+                # combined_loss=combined_loss_up/3
+                
+                # print("combined_loss", combined_loss)
+                # # quantization_loss = quantization_loss/max_total_loss
+                # # print("quantization_losses is", quantization_loss)
+                
+                batch_images = batch['mask'].shape[0]
+
+                # mask1 = torch.argmax(mask, dim=1)
+                # mask1 = [(mask1 == 0), (mask1 == 1) | (mask1 == 3), (mask1 == 1) | (mask1 == 3) | (mask1 == 2), (mask1 == 3)]
+                # mask1 = torch.stack(mask1, dim=1).float()
+                # print("mask shape is", mask1.shape)
+                # reconstruction = torch.argmax(reconstruction_all, dim=1)
+                # reconstruction = [(reconstruction == 0), (reconstruction == 1) | (reconstruction == 3), (reconstruction == 1) | (reconstruction == 3) | (reconstruction == 2), (reconstruction == 3)]
+                # reconstruction = torch.stack(reconstruction, dim=1).float()
+                # print("reconstruction shape is", reconstruction.shape)
+                # combined_loss_bts = dice_loss(reconstruction, mask1)
+                # combined_loss_bts = combined_loss_bts.mean(dim=0)
+    
+                # print(f"BG_loss_{combined_loss_bts[0]}__________TC_loss_{combined_loss_bts[1]}___________WT_loss_{combined_loss_bts[2]}_____________ET_loss_{combined_loss_bts[3]}")
+                # mask_tobe = torch.argmax(mask, dim=1)
+                # mask_tobe = np.unique(mask_tobe)
+                # if len(mask_tobe) == 4:
+                    
+                for idx, (key, value) in enumerate(class_losses_sum_overall_wo.items()):
+                    class_losses_sum_overall_wo[key]+=((combined_loss[idx].item())*batch_images)
+
+                # for idx, (key, value) in enumerate(class_losses_sum_overall.items()):
+                #     class_losses_sum_overall[key]+=((combined_loss_bts[idx].item())*batch_images)
+            # else:
+                for idx, (key, value) in enumerate(class_losses_sum_overall_wo.items()):
+                    class_losses_sum_overall_wo[key]+= 0
+
+                # for idx, (key, value) in enumerate(class_losses_sum_overall.items()):
+                #     class_losses_sum_overall[key]+= 0
+                    
+                # print("class_losses_sum_overall", class_losses_sum_overall)
+                
+                # # # print("batch_images", batch_images)
+                # # print("batch_images", batch_images)
+                # for key, value in class_losses_sum_un.items():
+                #     class_losses_sum_overall[key]+=value*batch_images
+                # print("class_losses_sum_overall", class_losses_sum_overall)
+                
+                # combined_loss = l1_loss(reconstruction.float(), mask.float())
+                # loss = (reconstruction_loss + quantization_loss)
+                print("total loss is", loss)
+                loss_test = loss*batch_images
+    
+
+    
+            
+                test_loss += loss_test  # Accumulate the loss value
+                    
+        for key, value in class_losses_sum_overall_wo.items():
+            class_losses_sum_overall_wo[key] = (1-value / test_dataset_len)
+        print("class_losses_sum_overall_wo", class_losses_sum_overall_wo)
+
+    
+        # for key, value in class_losses_sum_overall.items():
+        #     class_losses_sum_overall[key] = (1-value / test_dataset_len)
+        # print("class_losses_sum_overall", class_losses_sum_overall)
+            # print("mask shape is", mask.shape)
+            # print("reconstruction_all shape is", reconstruction_all.shape)
+            # print("mask shape is", test_loss / test_dataset_len)
+            # print("class_losses_sum_overall shape is", mask.shape)
+            # Return the average loss over the validation dataset
+        yield z, mask, reconstruction_all, test_loss / test_dataset_len, combined_loss, reconstruction, mask1
+
+
+
+
+# from __future__ import annotations
+# import torch
+# import torch.nn as nn
+# import torch.nn.functional as F
+# from torch.amp import GradScaler, autocast
+# import tqdm
+# from torch.nn import L1Loss
+# import visdom
+# import nibabel as nib
+# import numpy as np
+# import os
+# from src import VQVAE_mod
+# from src.VQVAE_mod import VQVAE
+# from monai.utils import first, set_determinism
+# from torch.optim import Adam
+
+
+# import warnings
+# from collections.abc import Callable, Sequence
+# from typing import Any
+
+# import numpy as np
+# import torch
+# import torch.nn as nn
+# import torch.nn.functional as F
+# from torch.nn.modules.loss import _Loss
+
+# from monai.losses.focal_loss import FocalLoss
+# from monai.losses.spatial_mask import MaskedLoss
+# from monai.networks import one_hot
+# from monai.utils import DiceCEReduction, LossReduction, Weight, deprecated_arg, look_up_option, pytorch_after
+
+
+# class DiceLoss(_Loss):
+#     """
+#     Compute average Dice loss between two tensors. It can support both multi-classes and multi-labels tasks.
+#     The data `input` (BNHW[D] where N is number of classes) is compared with ground truth `target` (BNHW[D]).
+
+#     Note that axis N of `input` is expected to be logits or probabilities for each class, if passing logits as input,
+#     must set `sigmoid=True` or `softmax=True`, or specifying `other_act`. And the same axis of `target`
+#     can be 1 or N (one-hot format).
+
+#     The `smooth_nr` and `smooth_dr` parameters are values added to the intersection and union components of
+#     the inter-over-union calculation to smooth results respectively, these values should be small.
+
+#     The original paper: Milletari, F. et. al. (2016) V-Net: Fully Convolutional Neural Networks forVolumetric
+#     Medical Image Segmentation, 3DV, 2016.
+
+#     """
+
+#     def __init__(
+#         self,
+#         include_background: bool = True,
+#         to_onehot_y: bool = False,
+#         sigmoid: bool = False,
+#         softmax: bool = False,
+#         other_act: Callable | None = None,
+#         squared_pred: bool = False,
+#         jaccard: bool = False,
+#         reduction: LossReduction | str = LossReduction.NONE,
+#         smooth_nr: float = 1e-5,
+#         smooth_dr: float = 1e-5,
+#         batch: bool = False,
+#         weight: Sequence[float] | float | int | torch.Tensor | None = None,
+#     ) -> None:
+#         """
+#         Args:
+#             include_background: if False, channel index 0 (background category) is excluded from the calculation.
+#                 if the non-background segmentations are small compared to the total image size they can get overwhelmed
+#                 by the signal from the background so excluding it in such cases helps convergence.
+#             to_onehot_y: whether to convert the ``target`` into the one-hot format,
+#                 using the number of classes inferred from `input` (``input.shape[1]``). Defaults to False.
+#             sigmoid: if True, apply a sigmoid function to the prediction.
+#             softmax: if True, apply a softmax function to the prediction.
+#             other_act: callable function to execute other activation layers, Defaults to ``None``. for example:
+#                 ``other_act = torch.tanh``.
+#             squared_pred: use squared versions of targets and predictions in the denominator or not.
+#             jaccard: compute Jaccard Index (soft IoU) instead of dice or not.
+#             reduction: {``"none"``, ``"mean"``, ``"sum"``}
+#                 Specifies the reduction to apply to the output. Defaults to ``"mean"``.
+
+#                 - ``"none"``: no reduction will be applied.
+#                 - ``"mean"``: the sum of the output will be divided by the number of elements in the output.
+#                 - ``"sum"``: the output will be summed.
+
+#             smooth_nr: a small constant added to the numerator to avoid zero.
+#             smooth_dr: a small constant added to the denominator to avoid nan.
+#             batch: whether to sum the intersection and union areas over the batch dimension before the dividing.
+#                 Defaults to False, a Dice loss value is computed independently from each item in the batch
+#                 before any `reduction`.
+#             weight: weights to apply to the voxels of each class. If None no weights are applied.
+#                 The input can be a single value (same weight for all classes), a sequence of values (the length
+#                 of the sequence should be the same as the number of classes. If not ``include_background``,
+#                 the number of classes should not include the background category class 0).
+#                 The value/values should be no less than 0. Defaults to None.
+
+#         Raises:
+#             TypeError: When ``other_act`` is not an ``Optional[Callable]``.
+#             ValueError: When more than 1 of [``sigmoid=True``, ``softmax=True``, ``other_act is not None``].
+#                 Incompatible values.
+
+#         """
+#         super().__init__(reduction=LossReduction(reduction).value)
+#         if other_act is not None and not callable(other_act):
+#             raise TypeError(f"other_act must be None or callable but is {type(other_act).__name__}.")
+#         if int(sigmoid) + int(softmax) + int(other_act is not None) > 1:
+#             raise ValueError("Incompatible values: more than 1 of [sigmoid=True, softmax=True, other_act is not None].")
+#         self.include_background = include_background
+#         self.to_onehot_y = to_onehot_y
+#         self.sigmoid = sigmoid
+#         self.softmax = softmax
+#         self.other_act = other_act
+#         self.squared_pred = squared_pred
+#         self.jaccard = jaccard
+#         self.smooth_nr = float(smooth_nr)
+#         self.smooth_dr = float(smooth_dr)
+#         self.batch = batch
+#         weight = torch.as_tensor(weight) if weight is not None else None
+#         self.register_buffer("class_weight", weight)
+#         self.class_weight: None | torch.Tensor
+
+#     def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+#         """
+#         Args:
+#             input: the shape should be BNH[WD], where N is the number of classes.
+#             target: the shape should be BNH[WD] or B1H[WD], where N is the number of classes.
+
+#         Raises:
+#             AssertionError: When input and target (after one hot transform if set)
+#                 have different shapes.
+#             ValueError: When ``self.reduction`` is not one of ["mean", "sum", "none"].
+
+#         Example:
+#             >>> from monai.losses.dice import *  # NOQA
+#             >>> import torch
+#             >>> from monai.losses.dice import DiceLoss
+#             >>> B, C, H, W = 7, 5, 3, 2
+#             >>> input = torch.rand(B, C, H, W)
+#             >>> target_idx = torch.randint(low=0, high=C - 1, size=(B, H, W)).long()
+#             >>> target = one_hot(target_idx[:, None, ...], num_classes=C)
+#             >>> self = DiceLoss(reduction='none')
+#             >>> loss = self(input, target)
+#             >>> assert np.broadcast_shapes(loss.shape, input.shape) == input.shape
+#         """
+#         if self.sigmoid:
+#             input = torch.sigmoid(input)
+
+#         n_pred_ch = input.shape[1]
+#         if self.softmax:
+#             if n_pred_ch == 1:
+#                 warnings.warn("single channel prediction, `softmax=True` ignored.")
+#             else:
+#                 input = torch.softmax(input, 1)
+
+#         if self.other_act is not None:
+#             input = self.other_act(input)
+
+#         if self.to_onehot_y:
+#             if n_pred_ch == 1:
+#                 warnings.warn("single channel prediction, `to_onehot_y=True` ignored.")
+#             else:
+#                 # print("target shape is", target.shape)
+#                 target = one_hot(target, num_classes=n_pred_ch)
+#                 # print("target shape is", target.shape)
+
+#         if not self.include_background:
+#             if n_pred_ch == 1:
+#                 warnings.warn("single channel prediction, `include_background=False` ignored.")
+#             else:
+#                 # if skipping background, removing first channel
+#                 target = target[:, 1:]
+#                 input = input[:, 1:]
+#                 # print("target shape is", target.shape)
+#                 # print("input shape is", input.shape)
+
+#         if target.shape != input.shape:
+#             raise AssertionError(f"ground truth has different shape ({target.shape}) from input ({input.shape})")
+
+#         # reducing only spatial dimensions (not batch nor channels)
+#         reduce_axis: list[int] = torch.arange(2, len(input.shape)).tolist()
+#         if self.batch:
+#             # reducing spatial dimensions and batch
+#             reduce_axis = [0] + reduce_axis
+
+#         intersection = torch.sum(target * input, dim=reduce_axis)
+
+#         if self.squared_pred:
+#             ground_o = torch.sum(target**2, dim=reduce_axis)
+#             pred_o = torch.sum(input**2, dim=reduce_axis)
+#         else:
+#             ground_o = torch.sum(target, dim=reduce_axis)
+#             pred_o = torch.sum(input, dim=reduce_axis)
+
+#         denominator = ground_o + pred_o
+#         # print(f"Intersection: {intersection}")
+#         # print(f"Denominator: {denominator}")
+
+#         if self.jaccard:
+#             denominator = 2.0 * (denominator - intersection)
+
+#         f: torch.Tensor = 1.0 - (2.0 * intersection + self.smooth_nr) / (denominator + self.smooth_dr)
+#         dice = 1.0 - (2.0 * intersection + self.smooth_nr) / (denominator + self.smooth_dr)
+#         # print(f"Dice: {dice}")
+
+#         num_of_classes = target.shape[1]
+#         if self.class_weight is not None and num_of_classes != 1:
+#             # make sure the lengths of weights are equal to the number of classes
+#             if self.class_weight.ndim == 0:
+#                 self.class_weight = torch.as_tensor([self.class_weight] * num_of_classes)
+#             else:
+#                 if self.class_weight.shape[0] != num_of_classes:
+#                     raise ValueError(
+#                         """the length of the `weight` sequence should be the same as the number of classes.
+#                         If `include_background=False`, the weight should not include
+#                         the background category class 0."""
+#                     )
+#             if self.class_weight.min() < 0:
+#                 raise ValueError("the value/values of the `weight` should be no less than 0.")
+#             # apply class_weight to loss
+#             f = f * self.class_weight.to(f)
+
+#         if self.reduction == LossReduction.MEAN.value:
+#             f = torch.mean(f)  # the batch and channel average
+#         elif self.reduction == LossReduction.SUM.value:
+#             f = torch.sum(f)  # sum over the batch and channel dims
+#         elif self.reduction == LossReduction.NONE.value:
+#             # If we are not computing voxelwise loss components at least
+#             # make sure a none reduction maintains a broadcastable shape
+#             broadcast_shape = list(f.shape[0:2]) + [1] * (len(input.shape) - 2)
+#             f = f.view(broadcast_shape)
+#         else:
+#             raise ValueError(f'Unsupported reduction: {self.reduction}, available options are ["mean", "sum", "none"].')
+
+#         return f
+# # from losses import DiceCELoss
+# # from monai.metrics import DiceMetric, compute_meandice, compute_hausdorff_distance, compute_average_surface_distance
+# weight_BG = 1.0   # Weight for Edema class
+# weight_ED = 1.0   # Weight for Edema class
+# weight_NC = 2.0   # Weight for Necrotic Core class (higher because it's underperforming)
+# weight_ET = 2.0   # Weight for Enhancing Tumor class (higher because it's underperforming)
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# weights = torch.tensor([weight_BG, weight_NC, weight_ED, weight_ET], dtype=torch.float32).to(device)
+# dice_loss = DiceLoss(to_onehot_y=False, softmax=False)
+# # dice_loss2 = DiceLoss(to_onehot_y=, softmax=False)
+# # dice_loss = DiceLoss(to_onehot_y=True, softmax=False)
+
+# scaler = GradScaler()
+
+# def train_vae(model, train_loader, train_dataset_len, optimizer, device):
+#     """
+#     Train the VAE model for one epoch with mixed precision.
+#     """
+#     model = model.to(device)
+#     #for epoch in range(n_epochs):
+#     model.train()
+#     scaler = GradScaler()
+#     epoch_loss = 0
+#     quantization_losses = 0
+#     # class_names = ["TC", "WT", "ET"]  # Names of the classes
+#     # Initialize dictionary to store sum of normalized losses
+#     class_losses_sum_overall_wo = {"BG":0, 'NC': 0, 'ED': 0, 'ET': 0}
+#     class_losses_sum_overall = {"BG":0, 'TC': 0, 'WT': 0, 'ET': 0}
+#     # class_losses_sum_overall = {"BG":0, 'NC': 0}
+#     batch_count = 0
+#     encodings_sumation = torch.zeros(1024).to(device)
+#     torch.autograd.set_detect_anomaly(True)
+#     for step, batch in enumerate(train_loader):
+#         # print("batch_count", batch_count)
+#         # batch_count += 1
+#         # print("step", step)
+#         # print("length of train loader", len(train_loader))
+        
+
+
+#         print("Training in Progress")
+#         # mask = batch['mask'].to(device)
+#         images={}
+#         for key in ["t1n", "t2w", "t1c", "t2f"]:
+#             if key in batch:
+#                 images[key] = batch[key]
+#                 #print(f"image shape with modality {key} is", batch[key].shape)
+#             else:
+#                 raise KeyError(f"Key {key} not found in batch_data")  # Ensure key exists
+    
+#         # Stack modalities along the channel dimension (dim=1)
+#         images = torch.stack([images['t1n'], images['t2w'], images['t1c'], images['t2f']], dim=1)
+#         # print("image shape with stacked modality is", images.shape)
+        
+#         # Get the segmentation mask from batch_data
+#         if 'mask' in batch:
+#             mask = batch['mask']
+#             # print("image shape with seg_mask is", mask.shape)
+#         else:
+#             raise KeyError("Key 'segmentation' not found in batch_data") 
+        
+#         optimizer.zero_grad(set_to_none=True)
+#         images = images.to(device)
+#         mask = mask.to(device)
+#         print("mask shape is", mask.shape)
+#         mask_up = mask[:, 1:, :, :, :]
+#         print("mask_up shape is", mask_up.shape)
+#         with autocast(device_type='cuda', enabled=False):
+            
+    
+#             # model outputs reconstruction and the quantization error
+#             z_quantized_all, z_quantized0, z_quantized1, z_quantized2, z_quantized3, reconstruction, quantization_loss, encodings_sum, embedding0, embedding1, embedding2, embedding3, quantization_loss4= model(mask_up)
+
+            
+#             # z, reconstruction, quantization_loss, encodings_sum, embedding0= model(mask)
+#             # encodings_sum = encodings_sum.detach()
+#             # print("encodings_sum", encodings_sum.dtype)
+#             non_zero_count = torch.count_nonzero(encodings_sum)
+#             print(f"Number of non-zero elements: {non_zero_count}")
+#             print("embedding0 shape is", embedding0.shape)
+#             # print("embedding1 shape is", embedding1.shape)
+#             # print("embedding2 shape is", embedding2.shape)
+#             # print("embedding3 shape is", embedding3.shape)
+#             encodings_sumation += encodings_sum
+
+#             # print("encodings_sumation", encodings_sumation)
+            
+#             # print("datatype of recon is", reconstruction.dtype)
+#             # print("reconstruction sum is", torch.sum(reconstruction))
+#             # reconstruction = reconstruction.to(torch.float32)
+#             # mask = mask.to(torch.float32)
+#             # print("datatype of recon is", reconstruction.dtype)
+#             # print("reconstruction sum is", torch.sum(reconstruction))
+#             # quantization_loss = quantization_loss / 4
+
+
+#             quantization_loss = quantization_loss4
+#             # print("Mask_sum is", torch.sum(mask))
+#             # Visualization at specified steps
+#             # norm_factor_BG = torch.sum(mask==0)
+
+#             # print("reconstruction.float()", reconstruction.shape)
+#             # norm_factor_BG = torch.sum(mask==0)
+#             # print("norm_factor_BG", norm_factor_BG)
+#             # norm_factor_NC = torch.sum(mask==1)
+#             # # print("norm_factor_NC", norm_factor_NC)
+#             # norm_factor_ED = torch.sum(mask==2)
+#             # # print("norm_factor_ED", norm_factor_ED)
+#             # norm_factor_EN = torch.sum(mask==3)
+#             # print("norm_factor_EN", norm_factor_EN)
+            
+    
+#             combined_loss = dice_loss(reconstruction, mask)
+#             # print("combined_loss shape is", combined_loss.shape)
+#             combined_loss = combined_loss.mean(dim=0)
+
+#             print(f"BG_loss_{combined_loss[0]}__________NC_loss_{combined_loss[1]}___________ED_loss_{combined_loss[2]}_____________ET_loss_{combined_loss[3]}")
+#             # print(f"BG_loss_{combined_loss[0]}__________NC_loss_{combined_loss[1]}")
+
+#             loss_BG = combined_loss[0]
+#             # class_losses_sum_overall+=
+#             # print("combined_loss shape is", combined_loss.shape)
+#             # print("combined_loss is", combined_loss)
+#             loss_NC = combined_loss[1]
+#             # print("loss_NC is", loss_NC.shape)
+#             # print("loss_NC is", loss_NC)
+#             # print("loss_NC is", loss_NC.item())
+#             loss_ED = combined_loss[2]
+#             # print("loss_ED is", loss_ED.shape)
+#             # print("loss_ED is", loss_ED)
+#             # print("loss_ED is", loss_ED.item())
+#             loss_EN = combined_loss[3]
+#             # print("loss_ED is", loss_EN.shape)
+#             # print("loss_ED is", loss_EN)
+#             # print("loss_ED is", loss_EN.item())
+
+#             # norm_BG = loss_BG*batch['mask'].shape[0]/norm_factor_BG
+
+#             # norm_NC = loss_NC*batch['mask'].shape[0]/norm_factor_NC
+#             # # print("norm_loss_NC is", norm_NC.item())
+#             # norm_ED = loss_ED*batch['mask'].shape[0]/norm_factor_ED
+#             # # print("norm_loss_EN is", norm_ED.item())
+#             # norm_EN = loss_EN*batch['mask'].shape[0]/norm_factor_EN
+#             # print("norm_loss_EN is", norm_EN.item())
+            
+
+#             # max_combined_loss = max(norm_NC, norm_ED, norm_EN)
+#             # norm_NC = (norm_NC+1e-4)/(max_combined_loss+1e-4)
+#             # norm_ED = (norm_ED+1e-4)/(max_combined_loss+1e-4)
+#             # norm_EN = (norm_EN+1e-4)/(max_combined_loss+1e-4)
+            
+            
+#             re_norm_combined_loss = ((loss_BG+loss_NC+loss_ED+loss_EN))
+#             print("re_norm_combined_loss", re_norm_combined_loss)
+
+            
+
+#             # min_normalized_losses= min(normalized_losses)
+#             # max_normalized_losses= max (normalized_losses)
+#             # combined_loss_up=0
+#             # for dice_los in normalized_losses:
+#             #     # print("dic_los", dice_los)
+#             #     dic_loss_update = (dice_los+1e-6)/(max_normalized_losses+1e-6)
+#             #     # print("dic_loss_update", dic_loss_update)
+#             #     combined_loss_up+=dic_loss_update
+#             # # print("combined_loss", combined_loss)
+#             # # num_voxels = mask.view(-1).numel()
+#             # # print(f"Total Voxels in the 3D Image: {num_voxels}")
+#             # # total_voxels=
+#             # combined_loss=combined_loss_up/3
+#             # # print("combined_loss", combined_loss)
+#             # # print("losses_dict", losses_dict)
+#             # # print("class_losses_sum", class_losses_sum)
+#             # # max_total_loss = max(combined_loss, quantization_loss)
+#             # # combined_loss = combined_loss/max_total_loss
+#             # print("dice_loss", combined_loss)
+#             # # quantization_loss = quantization_loss/max_total_loss
+#             print("quantization_losses is", quantization_loss)
+#             batch_images = batch['mask'].shape[0]
+
+
+#             for idx, (key, value) in enumerate(class_losses_sum_overall_wo.items()):
+#                 class_losses_sum_overall_wo[key]+=((combined_loss[idx].item())*batch_images)
+
+            
+#             mask = torch.argmax(mask, dim=1)
+#             print("mask shape is", mask.shape)
+#             mask = [(mask == 0), (mask == 1) | (mask == 3), (mask == 1) | (mask == 3) | (mask == 2), (mask == 3)]
+#             mask = torch.stack(mask, dim=1).float()
+
+#             print("Updated mask shape is", mask.shape)  # Should be (8, 4, 120, 120, 96)
+
+#             # mask = torch.stack(mask, dim=1).float()
+#             # print("mask shape is", mask.shape)
+#             reconstruction = torch.argmax(reconstruction, dim=1)
+#             reconstruction = [(reconstruction == 0), (reconstruction == 1) | (reconstruction == 3), (reconstruction == 1) | (reconstruction == 3) | (reconstruction == 2), (reconstruction == 3)]
+#             reconstruction = torch.stack(reconstruction, dim=1).float()
+#             print("reconstruction shape is", reconstruction.shape)
+#             combined_loss_bts = dice_loss(reconstruction, mask)
+#             combined_loss_bts = combined_loss_bts.mean(dim=0)
+
+#             print(f"BG_loss_{combined_loss_bts[0]}__________TC_loss_{combined_loss_bts[1]}___________WT_loss_{combined_loss_bts[2]}_____________ET_loss_{combined_loss_bts[3]}")
+#             for idx, (key, value) in enumerate(class_losses_sum_overall.items()):
+#                 class_losses_sum_overall[key]+=((combined_loss_bts[idx].item())*batch_images)
+#                 # print("class_losses_sum_overall", class_losses_sum_overall)
+            
+#             # # print("batch_images", batch_images)
+#             # for key, value in class_losses_sum_un.items():
+#             #     class_losses_sum_overall[key]+=value*batch_images
+#             # print("class_losses_sum_overall", class_losses_sum_overall)
+
+#             # combined_loss = l1_loss(reconstruction.float(), mask.float())
+            
+    
+#             loss = (re_norm_combined_loss + quantization_loss)
+#             print("total loss is", loss / 5)
+#             loss_tr = loss*batch_images
+#             quantization_loss=quantization_loss.item()*batch_images
+    
+#         scaler.scale(loss).backward()  # Scale loss and perform backward pass
+#         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.7)
+#         scaler.step(optimizer)  # Update model parameters
+#         scaler.update()
+    
+    
+#         epoch_loss += loss_tr.item()
+#         quantization_losses += quantization_loss
+#         # if (step + 1) % 2 == 0:
+            
+#         #         # Visualize middle slice of the first sample in the batch
+#         #     d = mask.shape[2]
+#         #         #for i in range (127):
+#         #     mask_np = mask[0, 0, :, :, d // 2].detach().cpu().numpy()
+#         #     reconstruction_np = reconstruction[0, 0, :, :, d // 2].detach().cpu().numpy()
+
+#         #     # Normalize images if they are not in [0, 1] range
+#         #     mask_np = (mask_np - mask_np.min()) / (mask_np.max() - mask_np.min())
+#         #     reconstruction_np = (reconstruction_np - reconstruction_np.min()) / (reconstruction_np.max() - reconstruction_np.min())
+                                
+#         #     viz.image(mask_np, opts=dict(title='Input Mask'))
+#         #     viz.image(reconstruction_np, opts=dict(title='Reconstruction'))
+
+#     # print("length of train loader", len(train_loader))
+#     # print(f"Total number of batches: {batch_count}")
+
+#     for key, value in class_losses_sum_overall_wo.items():
+#         class_losses_sum_overall_wo[key] = value / train_dataset_len
+    
+#     for key, value in class_losses_sum_overall.items():
+#         class_losses_sum_overall[key] = value / train_dataset_len
+#     # Return the average loss over the epoch
+#     return z_quantized_all, epoch_loss / train_dataset_len, class_losses_sum_overall, class_losses_sum_overall_wo, quantization_losses/train_dataset_len, encodings_sumation
+
+
+
+# def validate_vae(model, model_inferer, dataloader, val_dataset_len, device):
+#     """
+#     Validate the VAE model on the validation dataset.
+#     """
+#     print("Validation in Progress")
+#     # model = model.to(device)
+#     model.eval()  # Set the model to evaluation mode
+#     val_loss = 0  # Initialize total loss accumulator
+#     quantization_losses = 0
+#     class_losses_sum_overall_wo = {'BG': 0, 'NC': 0, 'ED': 0, 'ET': 0}
+#     class_losses_sum_overall = {'BG': 0, 'TC': 0, 'WT': 0, 'ET': 0}
+#     # class_losses_sum_overall = {'BG': 0, 'NC': 0}
+#     with torch.no_grad():  # Disable gradient computation for validation
+        
+#         for val_step, batch in enumerate(dataloader, start=1):
+            
+                       
+#             images={}
+#             for key in ["t1n", "t2w", "t1c", "t2f"]:
+#                 if key in batch:
+#                     images[key] = batch[key]
+#                    # print(f"image shape with modality {key} is", batch[key].shape)
+#                 else:
+#                     raise KeyError(f"Key {key} not found in batch_data")  # Ensure key exists
+        
+#             # Stack modalities along the channel dimension (dim=1)
+#             images = torch.stack([images['t1n'], images['t2w'], images['t1c'], images['t2f']], dim=1)
+#             # print("image shape with stacked modality is", images.shape)
+            
+#             # Get the segmentation mask from batch_data
+#             if 'mask' in batch:
+#                 mask = batch['mask']
+#                 # print("image shape with seg_mask is", mask.shape)
+#             else:
+#                 raise KeyError("Key 'segmentation' not found in batch_data") 
+
+#             images = images.to(device)
+#             mask = mask.to(device)
+#             mask_up = mask[:,1:,:,:,:]
+#             with autocast(device_type='cuda', enabled=False):  # Mixed precision context for validation
+#                 # reconstruction_loss, quantization_loss = custom_sliding_window_inference(mask, model, (120, 120, 80), 4, 0.5)                # reconstruction, quantization_loss = model_inferer(mask)  # Forward pass through the model
+#                 # # Visualization at specified steps
+#                 # # if (val_step + 1) % 2 == 0:
+#                 # #     # Visualize middle slice of the first sample in the batch
+#                 # #     d = mask.shape[2]
+#                 # #     mid_slice = d // 2     
+#                 # # #    viz.image(mask[0, 0, :, :, mid_slice].cpu().numpy(), opts=dict(title='Input Mask'))
+#                 # #     viz.image(reconstruction[0, 0, :, :, mid_slice].cpu().numpy(), opts=dict(title='Reconstruction'))
+#                 z, z_quantized0, z_quantized1, z_quantized2, z_quantized3, reconstruction, quantization_loss, encodings_sum, embedding0, embedding1, embedding2, embedding3, quantization_loss4 = model(mask_up)
+#                 if reconstruction.shape[4] > 155:
+#                     # print("256.shape", reconstruction.shape)
+#                     reconstruction = reconstruction[:, :, :, :, :-1]
+#                     # print("255.shape", reconstruction.shape)
+#                 # z, reconstruction, quantization_loss, encodings_sum, embedding0 = model(mask)
+#                 # print("datatype of recon is", reconstruction.dtype)
+#                 # print("reconstruction sum is", torch.sum(reconstruction))
+#                 # reconstruction = reconstruction.to(torch.float32)
+#                 # mask = mask.to(torch.float32)
+#                 # print("datatype of recon is", reconstruction.dtype)
+#                 # print("reconstruction sum is", torch.sum(reconstruction))
+#                 # quantization_loss = quantization_loss
+#                 # print("Mask_sum is", torch.sum(mask))
+#                 # Visualization at specified steps
+                
+#                 # print("reconstruction.float()", reconstruction.shape)
+                
+#                 # combined_loss = dice_loss(reconstruction, mask)
+
+#                 # min_normalized_losses= min(normalized_losses)
+#                 # max_normalized_losses= max (normalized_losses)
+#                 # combined_loss_up=0
+#                 # for dice_los in normalized_losses:
+#                 #     # print("dic_los", dice_los)
+#                 #     dic_loss_update = (dice_los+1e-6)/(max_normalized_losses+1e-6)
+#                 #     # print("dic_loss_update", dic_loss_update)
+#                 #     combined_loss_up+=dic_loss_update
+                
+#                 # combined_loss=combined_loss_up/3
+#                 norm_factor_BG = torch.sum(mask==0)
+#                 norm_factor_NC = torch.sum(mask==1)
+#                 # print("norm_factor_NC", norm_factor_NC)
+#                 # norm_factor_ED = torch.sum(mask==2)
+#                 # # print("norm_factor_ED", norm_factor_ED)
+#                 # norm_factor_EN = torch.sum(mask==3)
+#                 # print("norm_factor_EN", norm_factor_EN)
+#                 combined_loss = dice_loss(reconstruction, mask)
+#                 # print("combined_loss shape is", combined_loss.shape)
+#                 combined_loss = combined_loss.mean(dim=0)
+#                 print(f"BG_loss_{combined_loss[0]}_____________NC_loss_{combined_loss[1]}___________ED_loss_{combined_loss[2]}_____________ET_loss_{combined_loss[3]}")
+#                 # print(f"BG_loss_{combined_loss[0]}_____________NC_loss_{combined_loss[1]}")
+#                 # print("combined_loss shape is", combined_loss.shape)
+#                 # print("combined_loss is", combined_loss)
+#                 loss_BG = combined_loss[0]
+#                 loss_NC = combined_loss[1]
+#                 # print("loss_NC is", loss_NC.shape)
+#                 # print("loss_NC is", loss_NC)
+#                 # print("loss_NC is", loss_NC.item())
+#                 loss_ED = combined_loss[2]
+#                 # # print("loss_ED is", loss_ED.shape)
+#                 # # print("loss_ED is", loss_ED)
+#                 # # print("loss_ED is", loss_ED.item())
+#                 loss_EN = combined_loss[3]
+#                 # print("loss_ED is", loss_EN.shape)
+#                 # print("loss_ED is", loss_EN)
+#                 # print("loss_ED is", loss_EN.item())
+#                 # norm_BG = loss_BG*batch['mask'].shape[0]/norm_factor_BG
+#                 # norm_NC = loss_NC*batch['mask'].shape[0]/norm_factor_NC
+#                 # print("norm_loss_NC is", norm_NC.item())
+#                 # norm_ED = loss_ED*batch['mask'].shape[0]/norm_factor_ED
+#                 # # print("norm_loss_EN is", norm_ED.item())
+#                 # norm_EN = loss_EN*batch['mask'].shape[0]/norm_factor_EN
+#                 # print("norm_loss_EN is", norm_EN.item())
+                
+    
+#                 # max_combined_loss = max(norm_NC, norm_ED, norm_EN)
+#                 # norm_NC = (norm_NC+1e-4)/(max_combined_loss+1e-4)
+#                 # norm_ED = (norm_ED+1e-4)/(max_combined_loss+1e-4)
+#                 # norm_EN = (norm_EN+1e-4)/(max_combined_loss+1e-4)
+                
+#                 # quantization_loss = quantization_loss/4
+
+#                 quantization_loss = quantization_loss4
+
+                
+#                 re_norm_combined_loss = ((loss_BG+loss_NC+loss_ED+loss_EN))
+#                 # print("re_norm_combined_loss", re_norm_combined_loss)
+                    
+#                 # print("combined_loss", combined_loss)
+#                 # # quantization_loss = quantization_loss/max_total_loss
+#                 # # print("quantization_losses is", quantization_loss)
+#                 batch_images = batch['mask'].shape[0]
+
+#                 mask = torch.argmax(mask, dim=1)
+#                 mask = [(mask == 0), (mask == 1) | (mask == 3), (mask == 1) | (mask == 3) | (mask == 2), (mask == 3)]
+#                 mask = torch.stack(mask, dim=1).float()
+
+#                 print("Updated mask shape is", mask.shape)  # Should be (8, 4, 120, 120, 96)
+
+#                 # mask = torch.stack(mask, dim=1).float()
+#                 # print("mask shape is", mask.shape)
+#                 reconstruction = torch.argmax(reconstruction, dim=1)
+#                 reconstruction = [(reconstruction == 0), (reconstruction == 1) | (reconstruction == 3), (reconstruction == 1) | (reconstruction == 3) | (reconstruction == 2), (reconstruction == 3)]
+#                 reconstruction = torch.stack(reconstruction, dim=1).float()
+#                 print("reconstruction shape is", reconstruction.shape)
+#                 combined_loss_bts = dice_loss(reconstruction, mask)
+#                 combined_loss_bts = combined_loss_bts.mean(dim=0)
+    
+#                 print(f"BG_loss_{combined_loss_bts[0]}__________TC_loss_{combined_loss_bts[1]}___________WT_loss_{combined_loss_bts[2]}_____________ET_loss_{combined_loss_bts[3]}")
+
+#                 for idx, (key, value) in enumerate(class_losses_sum_overall_wo.items()):
+#                     class_losses_sum_overall_wo[key]+=((combined_loss[idx].item())*batch_images)
+
+#                 for idx, (key, value) in enumerate(class_losses_sum_overall.items()):
+#                     class_losses_sum_overall[key]+=((combined_loss_bts[idx].item())*batch_images)
+#                 # print("class_losses_sum_overall", class_losses_sum_overall)
+                
+#                 # # # print("batch_images", batch_images)
+#                 # print("class_losses_sum_overall", class_losses_sum_overall)
+                
+#                 # combined_loss = l1_loss(reconstruction.float(), mask.float())
+#                 loss = (re_norm_combined_loss + quantization_loss)
+#                 print("total loss is", loss / 5)
+#                 loss_val = loss*batch_images
+#                 quantization_loss=quantization_loss.item()*batch_images
+                
+    
+
+    
+            
+#             val_loss += loss_val.item()  # Accumulate the loss value
+#             quantization_losses += quantization_loss
+
+#     for key, value in class_losses_sum_overall_wo.items():
+#         class_losses_sum_overall_wo[key] = value / val_dataset_len
+
+    
+#     for key, value in class_losses_sum_overall.items():
+#         class_losses_sum_overall[key] = value / val_dataset_len
+
+#     # Return the average loss over the validation dataset
+#     return mask, reconstruction, z, val_loss / val_dataset_len, class_losses_sum_overall, class_losses_sum_overall_wo, quantization_losses/val_dataset_len, embedding0, embedding1, embedding2, embedding3
+
+
+
+
+# def test_vae(model, dataloader, device, test_dataset_len, output_dir):
+#     """
+#     Validate the VAE model on the validation dataset.
+#     """
+#     print("Validation in Progress")
+#     print(device)
+#     model = model.to(device)
+#     model.eval()  # Set the model to evaluation mode
+#     test_loss = 0  # Initialize total loss accumulator
+#     class_losses_sum_overall_wo = {'BG': 0, 'NC': 0, 'ED': 0, 'ET': 0}
+#     class_losses_sum_overall = {'BG': 0, 'TC': 0, 'WT': 0, 'ET': 0}
+    
+#     with torch.no_grad():  # Disable gradient computation for validation
+#         for test_step, batch in enumerate(dataloader, start=1):
+            
+                       
+#             images={}
+#             for key in ["t1n", "t2w", "t1c", "t2f"]:
+#                 if key in batch:
+#                     images[key] = batch[key]
+#                    # print(f"image shape with modality {key} is", batch[key].shape)
+#                 else:
+#                     raise KeyError(f"Key {key} not found in batch_data")  # Ensure key exists
+        
+#             # Stack modalities along the channel dimension (dim=1)
+#             images = torch.stack([images['t1n'], images['t2w'], images['t1c'], images['t2f']], dim=1)
+#             # print("image shape with stacked modality is", images.shape)
+            
+#             # Get the segmentation mask from batch_data
+#             if 'mask' in batch:
+#                 mask = batch['mask']
+#                 # print("image shape with seg_mask is", mask.shape)
+#             else:
+#                 raise KeyError("Key 'segmentation' not found in batch_data") 
+
+#             print(torch.cuda.is_available())
+
+#             images = images.to(device)
+#             mask = mask.to(device)
+#             mask_up = mask[:,1:,:,:,:]
+#             print(torch.cuda.is_available())
+#             with autocast(device_type='cuda', enabled=False):  # Mixed precision context for validation
+#                 # reconstruction_all, reconstruction_loss, quantization_loss = test_custom_sliding_window_inference(mask, model, (120, 120, 80), 4, 0.5) 
+                
+#                 # z, reconstruction_all, quantization_loss, summm, embedding0 = model(mask)
+#                 z, z_quantized0, z_quantized1, z_quantized2, z_quantized3, reconstruction_all, quantization_loss, summm, embedding0, embedding1, embedding2, embedding3 = model(mask_up)
+#                 # reconstruction_loss = dice_loss(reconstruction_all.float(), mask.float())
+#                 if reconstruction_all.shape[4] > 155:
+#                     # print("256.shape", reconstruction.shape)
+#                     reconstruction_all = reconstruction_all[:, :, :, :, :-1]
+#                 reconstruction_all=reconstruction_all.to(torch.float32)
+#                 mask = mask.to(torch.float32)
+#                 print("reconstruction_al", reconstruction_all.shape)
+
+#                 norm_factor_BG = torch.sum(mask[:,0,:,:,:])
+#                 print("norm_factor_BG", norm_factor_BG)
+#                 norm_factor_NC = torch.sum(mask[:,1,:,:,:])
+#                 print("norm_factor_NC", norm_factor_NC/1)
+#                 norm_factor_ED = torch.sum(mask[:,2,:,:,:])
+#                 print("norm_factor_ED", norm_factor_ED)
+#                 norm_factor_EN = torch.sum(mask[:,3,:,:,:])
+#                 print("norm_factor_EN", norm_factor_EN)
+        
+#                 combined_loss = dice_loss(reconstruction_all, mask)
+#                 # print("combined_loss shape is", combined_loss.shape)
+#                 combined_loss = combined_loss.mean(dim=0)
+#                 print(f"BG_loss_{combined_loss[0]}_____________NC_loss_{combined_loss[1]}___________ED_loss_{combined_loss[2]}_____________EN_loss_{combined_loss[3]}")
+#                 # print("combined_loss shape is", combined_loss.shape)
+#                 # print("combined_loss is", combined_loss)
+#                 loss_BG = combined_loss[0]
+#                 loss_NC = combined_loss[1]
+#                 # print("loss_NC is", loss_NC.shape)
+#                 # print("loss_NC is", loss_NC)
+#                 # print("loss_NC is", loss_NC.item())
+#                 loss_ED = combined_loss[2]
+#                 # print("loss_ED is", loss_ED.shape)
+#                 # print("loss_ED is", loss_ED)
+#                 # print("loss_ED is", loss_ED.item())
+#                 loss_EN = combined_loss[3]
+#                 # print("loss_ED is", loss_EN.shape)
+#                 # print("loss_ED is", loss_EN)
+#                 # print("loss_ED is", loss_EN.item())
+    
+#                 norm_NC = loss_NC*batch['mask'].shape[0]/norm_factor_NC
+#                 # print("norm_loss_NC is", norm_NC.item())
+#                 norm_ED = loss_ED*batch['mask'].shape[0]/norm_factor_ED
+#                 # print("norm_loss_EN is", norm_ED.item())
+#                 norm_EN = loss_EN*batch['mask'].shape[0]/norm_factor_EN
+#                 # print("norm_loss_EN is", norm_EN.item())
+                
+    
+#                 # max_combined_loss = max(norm_NC, norm_ED, norm_EN)
+#                 # norm_NC = (norm_NC+1e-4)/(max_combined_loss+1e-4)
+#                 # norm_ED = (norm_ED+1e-4)/(max_combined_loss+1e-4)
+#                 # norm_EN = (norm_EN+1e-4)/(max_combined_loss+1e-4)
+                
+                
+#                 re_norm_combined_loss = ((loss_BG+loss_NC+loss_ED+loss_EN))
+#                 # print("re_norm_combined_loss", re_norm_combined_loss)
+                    
+#                 # print("combined_loss", combined_loss)
+#                 # # quantization_loss = quantization_loss/max_total_loss
+#                 # # print("quantization_losses is", quantization_loss)
+#                 batch_images = batch['mask'].shape[0]
+
+#                 # for idx, (key, value) in enumerate(class_losses_sum_overall.items()):
+#                 #     class_losses_sum_overall[key]+=((combined_loss[idx].item())*batch_images)
+#                 # # print("class_losses_sum_overall", class_losses_sum_overall)
+                
+#                 # # # # print("batch_images", batch_images)
+#                 # for key, value in class_losses_sum_overall.items():
+#                 #     class_losses_sum_overall[key] = value / val_dataset_len
+#                 # print("class_losses_sum_overall", class_losses_sum_overall)
+                
+#                 # combined_loss = l1_loss(reconstruction.float(), mask.float())
+#                 loss = (re_norm_combined_loss + quantization_loss)
+#                 print("total loss is", loss)
+#                 # loss_val = loss*batch_images
+                
+
+#                 # reconstruction_all = reconstruction_all.squeeze().cpu().numpy()
+#                 # print("reconstruction_al", reconstruction_all.shape)
+#                 # reconstruction_all = nib.Nifti1Image(reconstruction_all, affine=np.eye(4))
+#                 # nib.save(reconstruction_all, os.path.join(output_dir, f'reconstructed_all_image_{test_step}.nii.gz'))
+
+#                 # mask = mask.squeeze().cpu().numpy()
+#                 # print("mask", mask.shape)
+#                 # mask = nib.Nifti1Image(mask, affine=np.eye(4))
+#                 # nib.save(mask, os.path.join(output_dir, f'mask_all_image_{test_step}.nii.gz'))
+                
+#                 # reconstruction, quantization_loss = model_inferer(mask)  # Forward pass through the model
+#                 # # Visualization at specified steps
+#                 # # if (val_step + 1) % 2 == 0:
+#                 # #     # Visualize middle slice of the first sample in the batch
+#                 # #     d = mask.shape[2]
+#                 # #     mid_slice = d // 2     
+#                 # # #    viz.image(mask[0, 0, :, :, mid_slice].cpu().numpy(), opts=dict(title='Input Mask'))
+#                 # #     viz.image(reconstruction[0, 0, :, :, mid_slice].cpu().numpy(), opts=dict(title='Reconstruction'))
+
+#                 # class_losses_sum, class_losses_sum_un, normalized_losses = compute_normalized_dice_loss(reconstruction.float(), mask.float())
+
+#                 # min_normalized_losses= min(normalized_losses)
+#                 # max_normalized_losses= max (normalized_losses)
+#                 # combined_loss_up=0
+#                 # for dice_los in normalized_losses:
+#                 #     # print("dic_los", dice_los)
+#                 #     dic_loss_update = (dice_los+1e-6)/(max_normalized_losses+1e-6)
+#                 #     # print("dic_loss_update", dic_loss_update)
+#                 #     combined_loss_up+=dic_loss_update
+                
+#                 # combined_loss=combined_loss_up/3
+                
+#                 # print("combined_loss", combined_loss)
+#                 # # quantization_loss = quantization_loss/max_total_loss
+#                 # # print("quantization_losses is", quantization_loss)
+                
+#                 batch_images = batch['mask'].shape[0]
+
+#                 mask1 = torch.argmax(mask, dim=1)
+#                 mask1 = [(mask1 == 0), (mask1 == 1) | (mask1 == 3), (mask1 == 1) | (mask1 == 3) | (mask1 == 2), (mask1 == 3)]
+#                 mask1 = torch.stack(mask1, dim=1).float()
+#                 print("mask shape is", mask1.shape)
+#                 reconstruction = torch.argmax(reconstruction_all, dim=1)
+#                 reconstruction = [(reconstruction == 0), (reconstruction == 1) | (reconstruction == 3), (reconstruction == 1) | (reconstruction == 3) | (reconstruction == 2), (reconstruction == 3)]
+#                 reconstruction = torch.stack(reconstruction, dim=1).float()
+#                 print("reconstruction shape is", reconstruction.shape)
+#                 combined_loss_bts = dice_loss(reconstruction, mask1)
+#                 combined_loss_bts = combined_loss_bts.mean(dim=0)
+    
+#                 print(f"BG_loss_{combined_loss_bts[0]}__________TC_loss_{combined_loss_bts[1]}___________WT_loss_{combined_loss_bts[2]}_____________ET_loss_{combined_loss_bts[3]}")
+#                 # mask_tobe = torch.argmax(mask, dim=1)
+#                 # mask_tobe = np.unique(mask_tobe)
+#                 # if len(mask_tobe) == 4:
+                    
+#                 for idx, (key, value) in enumerate(class_losses_sum_overall_wo.items()):
+#                     class_losses_sum_overall_wo[key]+=((combined_loss[idx].item())*batch_images)
+
+#                 for idx, (key, value) in enumerate(class_losses_sum_overall.items()):
+#                     class_losses_sum_overall[key]+=((combined_loss_bts[idx].item())*batch_images)
+#             # else:
+#                 for idx, (key, value) in enumerate(class_losses_sum_overall_wo.items()):
+#                     class_losses_sum_overall_wo[key]+= 0
+
+#                 for idx, (key, value) in enumerate(class_losses_sum_overall.items()):
+#                     class_losses_sum_overall[key]+= 0
+                    
+#                 # print("class_losses_sum_overall", class_losses_sum_overall)
+                
+#                 # # # print("batch_images", batch_images)
+#                 # # print("batch_images", batch_images)
+#                 # for key, value in class_losses_sum_un.items():
+#                 #     class_losses_sum_overall[key]+=value*batch_images
+#                 # print("class_losses_sum_overall", class_losses_sum_overall)
+                
+#                 # combined_loss = l1_loss(reconstruction.float(), mask.float())
+#                 # loss = (reconstruction_loss + quantization_loss)
+#                 print("total loss is", loss)
+#                 loss_test = loss*batch_images
+    
+
+    
+            
+#                 test_loss += loss_test  # Accumulate the loss value
+                    
+#         for key, value in class_losses_sum_overall_wo.items():
+#             class_losses_sum_overall_wo[key] = (1-value / test_dataset_len)
+#         print("class_losses_sum_overall_wo", class_losses_sum_overall_wo)
+
+    
+#         for key, value in class_losses_sum_overall.items():
+#             class_losses_sum_overall[key] = (1-value / test_dataset_len)
+#         print("class_losses_sum_overall", class_losses_sum_overall)
+#             # print("mask shape is", mask.shape)
+#             # print("reconstruction_all shape is", reconstruction_all.shape)
+#             # print("mask shape is", test_loss / test_dataset_len)
+#             # print("class_losses_sum_overall shape is", mask.shape)
+#             # Return the average loss over the validation dataset
+#         yield z, mask, reconstruction_all, test_loss / test_dataset_len, combined_loss, reconstruction, mask1
+

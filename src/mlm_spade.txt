@@ -1,0 +1,747 @@
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class LatentSPADE(nn.Module):
+    def __init__(self, norm_nc, latent_dim, kernel_size=3, norm_type='instance'):
+        super().__init__()
+
+        # Param-free normalization (BatchNorm or InstanceNorm)
+        if norm_type == 'instance':
+            self.param_free_norm = nn.InstanceNorm3d(norm_nc, affine=False)
+        elif norm_type == 'batch':
+            self.param_free_norm = nn.BatchNorm3d(norm_nc, affine=False)
+        else:
+            raise ValueError('%s is not a recognized param-free norm type in LatentSPADE' % norm_type)
+
+        # Convolutional layers to process 3D latent tensors
+        nhidden = 64  # Hidden channels
+        self.latent_conv1 = nn.Conv3d(latent_dim, nhidden, kernel_size=3, padding=1)
+        self.latent_conv2 = nn.Conv3d(nhidden, nhidden, kernel_size=3, padding=1)
+        self.latent_conv3 = nn.Conv3d(nhidden, nhidden*2, kernel_size=3, padding=1)
+        self.latent_conv4 = nn.Conv3d(nhidden*2, nhidden*4, kernel_size=3, padding=1)
+        self.latent_conv5 = nn.Conv3d(nhidden*4, nhidden*2, kernel_size=3, padding=1)
+        self.latent_conv6 = nn.Conv3d(nhidden*2, nhidden, kernel_size=3, padding=1)
+        self.latent_gamma = nn.Conv3d(nhidden, norm_nc, kernel_size=3, padding=1)
+        self.latent_beta = nn.Conv3d(nhidden, norm_nc, kernel_size=3, padding=1)
+
+        # Track running statistics (mean and variance)
+        self.register_buffer('running_mean', torch.zeros(1, norm_nc, 60, 60, 38))  # Match output dimensions
+        self.register_buffer('running_var', torch.ones(1, norm_nc, 60, 60, 38))
+
+    def forward(self, x, gt_latent=None, is_training=True):
+        # Normalize input tensor with param-free normalization
+        normalized = self.param_free_norm(x)
+
+        if is_training:
+            # Process latent tensor with convolutional layers
+            latent_features = F.relu(self.latent_conv1(gt_latent))
+            latent_features = F.relu(self.latent_conv2(latent_features))
+            latent_features = F.relu(self.latent_conv3(latent_features))
+            latent_features = F.relu(self.latent_conv4(latent_features))
+            latent_features = F.relu(self.latent_conv5(latent_features))
+            latent_features = F.relu(self.latent_conv6(latent_features))
+            gamma = self.latent_gamma(latent_features)
+            beta = self.latent_beta(latent_features)
+            
+            self.running_mean.data.copy_(0.9 * self.running_mean + 0.1 * gamma.mean(dim=0, keepdim=True))
+            self.running_var.data.copy_(0.9 * self.running_var + 0.1 * beta.mean(dim=0, keepdim=True))
+            print("self.running_mean shape:", self.running_mean.shape)
+
+        # else:
+        # Use running statistics during inference
+        gamma = self.running_mean
+        beta = self.running_var
+        
+        print("Now learned gamma is being used")
+        # Apply gamma and beta to the normalized input
+        print("normalized shape is", normalized.shape)
+        out = normalized * (1 + gamma) + beta
+        return out
+
+        
+class LatentSPADEResnetBlock(nn.Module):
+    def __init__(self, fin, fout, latent_dim, norm_nc):
+        super().__init__()
+        self.learned_shortcut = (fin != fout)
+        fmiddle = min(fin, fout)
+
+        self.conv_0 = nn.Conv3d(fin, fmiddle, kernel_size=3, padding=1)
+        self.conv_1 = nn.Conv3d(fmiddle, fout, kernel_size=3, padding=1)
+
+        # Correctly handle the shortcut dimension matching
+        if self.learned_shortcut:
+            self.conv_s = nn.Conv3d(fin, fout, kernel_size=1, stride=1, bias=False)
+
+        self.norm_0 = LatentSPADE(norm_nc, latent_dim, kernel_size=3)
+        self.norm_1 = LatentSPADE(norm_nc, latent_dim, kernel_size=3)
+
+    def forward(self, x, gt_latent=None, is_training=True):
+        # Shortcut path
+        x_s = self.shortcut(x)
+
+        # Main path
+        dx = self.conv_0(self.actvn(self.norm_0(x, gt_latent, is_training)))
+        dx = self.conv_1(self.actvn(self.norm_1(dx, gt_latent, is_training)))
+
+        # Combine main and shortcut paths
+        out = x_s + dx
+        return out
+
+    def shortcut(self, x):
+        print("self.learned_shortcut", self.learned_shortcut)
+        if self.learned_shortcut:
+            x_s = self.conv_s(x)  # Apply the 1x1 convolution to match dimensions
+        else:
+            x_s = x  # No transformation needed for the shortcut
+        return x_s
+
+    def actvn(self, x):
+        return F.leaky_relu(x, 2e-1)
+
+
+class TransformerModeldec_mlm(nn.Module):
+    def __init__(self, z_dim, latent_dim):
+        super().__init__()
+        nf = 32  # Number of feature maps after input transformation
+
+        # Input SPADE block with updated input dimensions
+        self.in_spade = LatentSPADEResnetBlock(nf, nf, latent_dim, nf)
+
+        # Output SPADE block with consistent dimensions
+        self.out_spade = LatentSPADEResnetBlock(z_dim, z_dim, latent_dim, nf)
+
+        # Convolutions for input and output
+        self.conv_in = nn.Conv3d(z_dim, nf, kernel_size=3, padding=1)
+        self.conv_out = nn.Conv3d(nf, z_dim, kernel_size=3, padding=1)
+
+    def forward(self, x, gt_latent=None, is_training=False):
+        # Initial convolution to map input to feature space
+        x_s = self.conv_in(x)
+
+        # Pass through input SPADE block
+        x = self.in_spade(x_s, gt_latent, is_training) + x_s
+
+        # Output convolution
+        x_s = self.conv_out(x)
+
+        # Pass through output SPADE block
+        x = self.out_spade(x_s, gt_latent, is_training) + x_s
+
+        return x
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class LatentSPADE(nn.Module):
+    def __init__(self, norm_nc, latent_dim, kernel_size=3, norm_type='instance'):
+        super().__init__()
+
+        # Param-free normalization (BatchNorm or InstanceNorm)
+        if norm_type == 'instance':
+            self.param_free_norm = nn.InstanceNorm3d(norm_nc, affine=False)
+        elif norm_type == 'batch':
+            self.param_free_norm = nn.BatchNorm3d(norm_nc, affine=False)
+        else:
+            raise ValueError('%s is not a recognized param-free norm type in LatentSPADE' % norm_type)
+
+        # Convolutional layers to process 3D latent tensors
+        nhidden = 32  # Hidden channels
+        self.latent_conv1 = nn.Conv3d(latent_dim, nhidden, kernel_size=3, padding=1)
+        self.latent_gamma1 = nn.Conv3d(nhidden, norm_nc, kernel_size=3, padding=1)
+        self.latent_beta1 = nn.Conv3d(nhidden, norm_nc, kernel_size=3, padding=1)
+        
+        self.latent_conv2 = nn.Conv3d(nhidden, nhidden, kernel_size=3, padding=1)
+        self.latent_gamma2 = nn.Conv3d(nhidden, norm_nc, kernel_size=3, padding=1)
+        self.latent_beta2 = nn.Conv3d(nhidden, norm_nc, kernel_size=3, padding=1)
+        
+        self.latent_conv3 = nn.Conv3d(nhidden, nhidden, kernel_size=3, padding=1)
+        self.latent_gamma3 = nn.Conv3d(nhidden, norm_nc, kernel_size=3, padding=1)
+        self.latent_beta3 = nn.Conv3d(nhidden, norm_nc, kernel_size=3, padding=1)
+        
+        self.latent_conv4 = nn.Conv3d(nhidden, nhidden, kernel_size=3, padding=1)
+        self.latent_gamma4 = nn.Conv3d(nhidden, norm_nc, kernel_size=3, padding=1)
+        self.latent_beta4 = nn.Conv3d(nhidden, norm_nc, kernel_size=3, padding=1)
+        
+        self.latent_conv5 = nn.Conv3d(nhidden, nhidden, kernel_size=3, padding=1)
+        self.latent_gamma5 = nn.Conv3d(nhidden, norm_nc, kernel_size=3, padding=1)
+        self.latent_beta5 = nn.Conv3d(nhidden, norm_nc, kernel_size=3, padding=1)
+        
+        # self.latent_conv6 = nn.Conv3d(nhidden, nhidden, kernel_size=3, padding=1)
+        # self.latent_gamma = nn.Conv3d(nhidden, norm_nc, kernel_size=3, padding=1)
+        # self.latent_beta = nn.Conv3d(nhidden, norm_nc, kernel_size=3, padding=1)
+
+        # Track running statistics (mean and variance)
+        self.register_buffer('running_mean1', torch.zeros(1, norm_nc, 1, 1, 1))  # Match output dimensions
+        self.register_buffer('running_var1', torch.ones(1, norm_nc, 1, 1, 1))
+
+        self.register_buffer('running_mean2', torch.zeros(1, norm_nc, 1, 1, 1))  # Match output dimensions
+        self.register_buffer('running_var2', torch.ones(1, norm_nc, 1, 1, 1))
+
+        self.register_buffer('running_mean3', torch.zeros(1, norm_nc, 1, 1, 1))  # Match output dimensions
+        self.register_buffer('running_var3', torch.ones(1, norm_nc, 1, 1, 1))
+
+        self.register_buffer('running_mean4', torch.zeros(1, norm_nc, 1, 1, 1))  # Match output dimensions
+        self.register_buffer('running_var4', torch.ones(1, norm_nc, 1, 1, 1))
+
+        self.register_buffer('running_mean5', torch.zeros(1, norm_nc, 1, 1, 1))  # Match output dimensions
+        self.register_buffer('running_var5', torch.ones(1, norm_nc, 1, 1, 1))
+
+    def forward(self, x, gt_latent=None, is_training=True):
+        # Normalize input tensor with param-free normalization
+        normalized = self.param_free_norm(x)
+
+        if is_training:
+            # Process latent tensor with convolutional layers
+            latent_features = F.relu(self.latent_conv1(gt_latent))
+            gamma1 = self.latent_gamma1(latent_features)
+            beta1 = self.latent_beta1(latent_features)
+            
+            self.running_mean1.data.copy_(0.9 * self.running_mean1 + 0.1 * gamma1.mean(dim=(0,2,3,4), keepdim=True))
+            self.running_var1.data.copy_(0.9 * self.running_var1 + 0.1 * beta1.mean(dim=(0,2,3,4), keepdim=True))
+            print("self.running_mean shape:", self.running_mean1.shape)
+
+            
+            latent_features = F.relu(self.latent_conv2(latent_features))
+            gamma2 = self.latent_gamma2(latent_features)
+            beta2 = self.latent_beta2(latent_features)
+            
+            self.running_mean2.data.copy_(0.9 * self.running_mean2 + 0.1 * gamma2.mean(dim=(0,2,3,4), keepdim=True))
+            self.running_var2.data.copy_(0.9 * self.running_var2 + 0.1 * beta2.mean(dim=(0,2,3,4), keepdim=True))
+            print("self.running_mean shape:", self.running_mean2.shape)
+            
+            latent_features = F.relu(self.latent_conv3(latent_features))
+            gamma3 = self.latent_gamma3(latent_features)
+            beta3 = self.latent_beta3(latent_features)
+            
+            self.running_mean3.data.copy_(0.9 * self.running_mean3 + 0.1 * gamma3.mean(dim=(0,2,3,4), keepdim=True))
+            self.running_var3.data.copy_(0.9 * self.running_var3 + 0.1 * beta3.mean(dim=(0,2,3,4), keepdim=True))
+            print("self.running_mean shape:", self.running_mean3.shape)
+            
+            latent_features = F.relu(self.latent_conv4(latent_features))
+            gamma4 = self.latent_gamma4(latent_features)
+            beta4 = self.latent_beta4(latent_features)
+            
+            self.running_mean4.data.copy_(0.9 * self.running_mean4 + 0.1 * gamma4.mean(dim=(0,2,3,4), keepdim=True))
+            self.running_var4.data.copy_(0.9 * self.running_var4 + 0.1 * beta4.mean(dim=(0,2,3,4), keepdim=True))
+            print("self.running_mean shape:", self.running_mean4.shape)
+
+            
+            latent_features = F.relu(self.latent_conv5(latent_features))
+            gamma5 = self.latent_gamma5(latent_features)
+            beta5 = self.latent_beta5(latent_features)
+            
+            self.running_mean5.data.copy_(0.9 * self.running_mean5 + 0.1 * gamma5.mean(dim=(0,2,3,4), keepdim=True))
+            self.running_var5.data.copy_(0.9 * self.running_var5 + 0.1 * beta5.mean(dim=(0,2,3,4), keepdim=True))
+            print("self.running_mean shape:", self.running_mean5.shape)
+
+
+            # latent_features = F.relu(self.latent_conv6(latent_features))
+            gamma = self.latent_gamma(latent_features)
+            beta = self.latent_beta(latent_features)
+            
+            self.running_mean.data.copy_(0.9 * self.running_mean + 0.1 * gamma.mean(dim=(0,2,3,4), keepdim=True))
+            self.running_var.data.copy_(0.9 * self.running_var + 0.1 * beta.mean(dim=(0,2,3,4), keepdim=True))
+            print("self.running_mean shape:", self.running_mean.shape)
+
+        # else:
+        # Use running statistics during inference
+        gamma1 = self.running_mean1
+        beta1 = self.running_var1
+        
+        print("Now learned gamma is being used")
+        # Apply gamma and beta to the normalized input
+        print("normalized shape is", normalized.shape)
+        out = normalized * (1 + gamma1) + beta1
+
+        out = self.param_free_norm(out)
+        gamma1 = self.running_mean2
+        beta1 = self.running_var2
+        
+        print("Now learned gamma is being used")
+        # Apply gamma and beta to the normalized input
+        print("normalized shape is", normalized.shape)
+        out = out * (1 + gamma1) + beta1
+
+        out = self.param_free_norm(out)
+        gamma1 = self.running_mean3
+        beta1 = self.running_var3
+        
+        print("Now learned gamma is being used")
+        # Apply gamma and beta to the normalized input
+        print("normalized shape is", normalized.shape)
+        out = out * (1 + gamma1) + beta1
+
+        out = self.param_free_norm(out)
+        gamma1 = self.running_mean4
+        beta1 = self.running_var4
+        
+        print("Now learned gamma is being used")
+        # Apply gamma and beta to the normalized input
+        print("normalized shape is", normalized.shape)
+        out = out * (1 + gamma1) + beta1
+
+        out = self.param_free_norm(out)
+        gamma1 = self.running_mean5
+        beta1 = self.running_var5
+        
+        print("Now learned gamma is being used")
+        # Apply gamma and beta to the normalized input
+        print("normalized shape is", normalized.shape)
+        out = out * (1 + gamma1) + beta1
+        
+        
+        return out
+
+        
+class LatentSPADEResnetBlock(nn.Module):
+    def __init__(self, fin, fout, latent_dim, norm_nc):
+        super().__init__()
+        self.learned_shortcut = (fin != fout)
+        fmiddle = min(fin, fout)
+
+        self.conv_0 = nn.Conv3d(fin, fmiddle, kernel_size=3, padding=1)
+        self.conv_1 = nn.Conv3d(fmiddle, fout, kernel_size=3, padding=1)
+
+        # Correctly handle the shortcut dimension matching
+        if self.learned_shortcut:
+            self.conv_s = nn.Conv3d(fin, fout, kernel_size=1, stride=1, bias=False)
+
+        self.norm_0 = LatentSPADE(norm_nc, latent_dim, kernel_size=3)
+        self.norm_1 = LatentSPADE(norm_nc, latent_dim, kernel_size=3)
+
+    def forward(self, x, gt_latent=None, is_training=True):
+        # Shortcut path
+        x_s = self.shortcut(x)
+
+        # Main path
+        dx = self.conv_0(self.actvn(self.norm_0(x, gt_latent, is_training)))
+        dx = self.conv_1(self.actvn(self.norm_1(dx, gt_latent, is_training)))
+
+        # Combine main and shortcut paths
+        out = x_s + dx
+        return out
+
+    def shortcut(self, x):
+        print("self.learned_shortcut", self.learned_shortcut)
+        if self.learned_shortcut:
+            x_s = self.conv_s(x)  # Apply the 1x1 convolution to match dimensions
+        else:
+            x_s = x  # No transformation needed for the shortcut
+        return x_s
+
+    def actvn(self, x):
+        return F.leaky_relu(x, 2e-1)
+
+
+class TransformerModeldec_mlm(nn.Module):
+    def __init__(self, z_dim, latent_dim):
+        super().__init__()
+        nf = 32  # Number of feature maps after input transformation
+
+        # Input SPADE block with updated input dimensions
+        self.in_spade = LatentSPADEResnetBlock(nf, nf, latent_dim, nf)
+
+        # Output SPADE block with consistent dimensions
+        self.out_spade = LatentSPADEResnetBlock(z_dim, z_dim, latent_dim, nf)
+
+        # Convolutions for input and output
+        self.conv_in = nn.Conv3d(z_dim, nf, kernel_size=3, padding=1)
+        self.conv_out = nn.Conv3d(nf, z_dim, kernel_size=3, padding=1)
+
+    def forward(self, x, gt_latent=None, is_training=False):
+        # Initial convolution to map input to feature space
+        x_s = self.conv_in(x)
+
+        # Pass through input SPADE block
+        x = self.in_spade(x_s, gt_latent, is_training) + x_s
+
+        # Output convolution
+        x_s = self.conv_out(x)
+
+        # Pass through output SPADE block
+        x = self.out_spade(x_s, gt_latent, is_training) + x_s
+
+        return x
+
+
+
+
+
+
+
+class LatentSPADE(nn.Module):
+    def __init__(self, norm_nc, latent_dim, kernel_size=3, norm_type='instance'):
+        super().__init__()
+
+        # Param-free normalization (BatchNorm or InstanceNorm)
+        if norm_type == 'instance':
+            self.param_free_norm = nn.InstanceNorm3d(norm_nc, affine=False)
+        elif norm_type == 'batch':
+            self.param_free_norm = nn.BatchNorm3d(norm_nc, affine=False)
+        else:
+            raise ValueError('%s is not a recognized param-free norm type in LatentSPADE' % norm_type)
+
+        # Convolutional layers to process 3D latent tensors
+        nhidden = 64  # Hidden channels
+        self.latent_conv1 = nn.Conv3d(latent_dim, nhidden, kernel_size=3, padding=1)
+        self.latent_conv2 = nn.Conv3d(nhidden, nhidden, kernel_size=3, padding=1)
+        self.latent_conv3 = nn.Conv3d(nhidden, nhidden*2, kernel_size=3, padding=1)
+        self.latent_conv4 = nn.Conv3d(nhidden*2, nhidden*4, kernel_size=3, padding=1)
+        self.latent_conv5 = nn.Conv3d(nhidden*4, nhidden*2, kernel_size=3, padding=1)
+        self.latent_conv6 = nn.Conv3d(nhidden*2, nhidden, kernel_size=3, padding=1)
+        self.latent_gamma = nn.Conv3d(nhidden, norm_nc, kernel_size=3, padding=1)
+        self.latent_beta = nn.Conv3d(nhidden, norm_nc, kernel_size=3, padding=1)
+
+        # Track running statistics (mean and variance)
+        self.register_buffer('running_mean', torch.zeros(1, norm_nc, 1, 1, 1))  # Match output dimensions
+        self.register_buffer('running_var', torch.ones(1, norm_nc, 1, 1, 1))
+
+    def forward(self, x, gt_latent=None, is_training=True):
+        # Normalize input tensor with param-free normalization
+        normalized = self.param_free_norm(x)
+
+        if is_training:
+            # Process latent tensor with convolutional layers
+            latent_features = F.relu(self.latent_conv1(gt_latent))
+            latent_features = F.relu(self.latent_conv2(latent_features))
+            latent_features = F.relu(self.latent_conv3(latent_features))
+            latent_features = F.relu(self.latent_conv4(latent_features))
+            latent_features = F.relu(self.latent_conv5(latent_features))
+            latent_features = F.relu(self.latent_conv6(latent_features))
+            gamma = self.latent_gamma(latent_features)
+            beta = self.latent_beta(latent_features)
+            
+            self.running_mean.data.copy_(0.9 * self.running_mean + 0.1 * gamma.mean(dim=(0,2,3,4), keepdim=True))
+            self.running_var.data.copy_(0.9 * self.running_var + 0.1 * beta.mean(dim=(0,2,3,4), keepdim=True))
+            print("self.running_mean shape:", self.running_mean.shape)
+
+        # else:
+        # Use running statistics during inference
+        gamma = self.running_mean
+        beta = self.running_var
+        
+        print("Now learned gamma is being used")
+        # Apply gamma and beta to the normalized input
+        print("normalized shape is", normalized.shape)
+        out = normalized * (1 + gamma) + beta
+        return out
+
+
+
+
+MLM based on distances
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class LatentSPADE(nn.Module):
+    def __init__(self, norm_nc, latent_dim, kernel_size=3, norm_type='instance', num_embeddings=128):
+        super().__init__()
+
+        if norm_type == 'instance':
+            self.param_free_norm = nn.InstanceNorm3d(norm_nc, affine=False)
+        elif norm_type == 'batch':
+            self.param_free_norm = nn.BatchNorm3d(norm_nc, affine=False)
+        else:
+            raise ValueError(f'{norm_type} is not a recognized param-free norm type in LatentSPADE')
+
+        nhidden = 64  # Hidden channels
+        self.latent_conv1 = nn.Conv3d(latent_dim, nhidden, kernel_size=3, padding=1)
+        self.latent_conv2 = nn.Conv3d(nhidden, nhidden, kernel_size=3, padding=1)
+        self.latent_conv3 = nn.Conv3d(nhidden, nhidden*2, kernel_size=3, padding=1)
+        self.latent_conv4 = nn.Conv3d(nhidden*2, nhidden*4, kernel_size=3, padding=1)
+        self.latent_conv5 = nn.Conv3d(nhidden*4, nhidden*2, kernel_size=3, padding=1)
+        self.latent_conv6 = nn.Conv3d(nhidden*2, nhidden, kernel_size=3, padding=1)
+        self.latent_gamma = nn.Conv3d(nhidden, norm_nc, kernel_size=3, padding=1)
+        self.latent_beta = nn.Conv3d(nhidden, norm_nc, kernel_size=3, padding=1)
+
+        self.register_buffer('gamma_embedding', torch.randn(num_embeddings, norm_nc, 32, 30, 30, 19))
+        self.register_buffer('beta_embedding', torch.randn(num_embeddings, norm_nc, 32, 30, 30, 19))
+
+    def find_closest_embedding(self, normalized):
+        distances = torch.norm(self.gamma_embedding - normalized, dim=[1, 2, 3, 4, 5])
+        return torch.argmin(distances)
+
+    def forward(self, x, gt_latent=None, is_training=True):
+        normalized = self.param_free_norm(x)
+        
+        if is_training and gt_latent is not None:
+            latent_features = F.relu(self.latent_conv1(gt_latent))
+            latent_features = F.relu(self.latent_conv2(latent_features))
+            latent_features = F.relu(self.latent_conv3(latent_features))
+            latent_features = F.relu(self.latent_conv4(latent_features))
+            latent_features = F.relu(self.latent_conv5(latent_features))
+            latent_features = F.relu(self.latent_conv6(latent_features))
+            gamma = self.latent_gamma(latent_features)
+            beta = self.latent_beta(latent_features)
+            
+            embed_index = self.find_closest_embedding(normalized)
+            self.gamma_embedding[embed_index].data.copy_(gamma.detach())
+            self.beta_embedding[embed_index].data.copy_(beta.detach())
+        else:
+            embed_index = self.find_closest_embedding(normalized)
+            gamma = self.gamma_embedding[embed_index]
+            beta = self.beta_embedding[embed_index]
+
+        return normalized * (1 + gamma) + beta
+
+
+
+
+
+class LatentSPADE(nn.Module):
+    def __init__(self, norm_nc, latent_dim, kernel_size=3, norm_type='instance', num_embeddings=64):
+        super().__init__()
+
+        if norm_type == 'instance':
+            self.param_free_norm = nn.InstanceNorm3d(norm_nc, affine=False)
+        elif norm_type == 'batch':
+            self.param_free_norm = nn.BatchNorm3d(norm_nc, affine=False)
+        else:
+            raise ValueError(f'{norm_type} is not a recognized param-free norm type in LatentSPADE')
+
+        nhidden = 64  # Hidden channels
+        self.latent_conv1 = nn.Conv3d(latent_dim, nhidden, kernel_size=3, padding=1)
+        self.latent_conv2 = nn.Conv3d(nhidden, nhidden, kernel_size=3, padding=1)
+        self.latent_conv3 = nn.Conv3d(nhidden, nhidden*2, kernel_size=3, padding=1)
+        self.latent_conv4 = nn.Conv3d(nhidden*2, nhidden*4, kernel_size=3, padding=1)
+        self.latent_conv5 = nn.Conv3d(nhidden*4, nhidden*2, kernel_size=3, padding=1)
+        self.latent_conv6 = nn.Conv3d(nhidden*2, nhidden, kernel_size=3, padding=1)
+        self.latent_gamma = nn.Conv3d(nhidden, norm_nc, kernel_size=3, padding=1)
+        self.latent_beta = nn.Conv3d(nhidden, norm_nc, kernel_size=3, padding=1)
+
+        self.register_buffer('gamma_embedding', torch.zeros(num_embeddings, norm_nc, 60, 60, 38))
+        self.register_buffer('beta_embedding', torch.ones(num_embeddings, norm_nc, 60, 60, 38))
+        self.embedding_counter = 0
+        self.num_embeddings = num_embeddings
+
+    def find_closest_embedding(self, normalized):
+        # distances = torch.norm(self.gamma_embedding - normalized, dim=[1, 2, 3, 4])
+        flat_input = normalized.view(normalized.shape[0], -1)  # Flatten spatial dimensions
+        flat_embeddings = self.gamma_embedding.view(self.num_embeddings, -1)  # Flatten stored embeddings
+    
+        distances = (
+            (flat_input**2).sum(dim=1, keepdim=True)  # ||x||^2
+            + (flat_embeddings**2).sum(dim=1, keepdim=False).unsqueeze(0)  # ||y||^2
+            - 2 * torch.mm(flat_input, flat_embeddings.t())  # -2 * x^T y
+        )
+    
+        return torch.argmin(distances, dim=1)
+
+    def forward(self, x, gt_latent=None, is_training=True):
+        normalized = self.param_free_norm(x)
+        
+        if is_training and gt_latent is not None:
+            latent_features = F.relu(self.latent_conv1(gt_latent))
+            latent_features = F.relu(self.latent_conv2(latent_features))
+            latent_features = F.relu(self.latent_conv3(latent_features))
+            latent_features = F.relu(self.latent_conv4(latent_features))
+            latent_features = F.relu(self.latent_conv5(latent_features))
+            latent_features = F.relu(self.latent_conv6(latent_features))
+            gamma = self.latent_gamma(latent_features)
+            beta = self.latent_beta(latent_features)
+            gamma = gamma.mean(dim=(0), keepdim=True)
+            beta = beta.mean(dim=(0), keepdim=True)
+            if self.embedding_counter < self.num_embeddings:
+                embed_index = self.embedding_counter
+                self.embedding_counter += 1
+            else:
+                embed_index = self.find_closest_embedding(normalized)
+                print("embed_index", embed_index)
+            print("self.embedding_counter", self.embedding_counter) 
+            print("self.gamma_embedding[embed_index]", self.gamma_embedding[embed_index].shape)
+            self.gamma_embedding[embed_index].data.copy_(0.9 * self.gamma_embedding[embed_index] + 0.1 * gamma.squeeze(0))
+            self.beta_embedding[embed_index].data.copy_(0.9 * self.beta_embedding[embed_index] + 0.1 * beta.squeeze(0))
+            gamma = self.gamma_embedding[embed_index]
+            beta = self.beta_embedding[embed_index]
+        # else:   
+        else:
+            embed_index = self.find_closest_embedding(normalized)
+            gamma = self.gamma_embedding[embed_index]
+            beta = self.beta_embedding[embed_index]
+
+        return normalized * (1 + gamma) + beta
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+class TransformerModeldec_mlm(nn.Module):
+    def __init__(self, input_channels=32, embed_size=(32, 60, 60, 38), max_register_size=5):
+        super(TransformerModeldec_mlm, self).__init__()
+        
+        # 5-layer 3D Conv network
+        self.conv_layers = nn.Sequential(
+            nn.Conv3d(32, 32, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv3d(32, 32, kernel_size=3, stride=1, padding=1),
+            nn.ReLU()
+        )
+        
+        # Register buffer for storing embeddings
+        self.register_buffer('embedding', torch.zeros((max_register_size, *embed_size)))
+        self.register_counter = 0
+        self.max_register_size = max_register_size
+
+    def find_closest_embedding(self, normalized):
+        # distances = torch.norm(self.gamma_embedding - normalized, dim=[1, 2, 3, 4])
+        flat_input = normalized.view(normalized.shape[0], -1)  # Flatten spatial dimensions
+        flat_embeddings = self.embedding.view(self.max_register_size, -1)  # Flatten stored embeddings
+    
+        distances = (
+            (flat_input**2).sum(dim=1, keepdim=True)  # ||x||^2
+            + (flat_embeddings**2).sum(dim=1, keepdim=False).unsqueeze(0)  # ||y||^2
+            - 2 * torch.mm(flat_input, flat_embeddings.t())  # -2 * x^T y
+        )
+    
+        return torch.argmin(distances, dim=1)
+
+
+    def forward(self, pred_latent, gt_latent, is_train=False):
+        if is_train:
+            avg_embedding = gt_latent.mean(dim=(0), keepdim=True)
+            if self.register_counter < self.max_register_size:
+                min_idx = self.register_counter
+                self.register_counter += 1                
+            else:
+                print("Using custom distance calculation")
+                min_idx = self.find_closest_embedding(pred_latent)
+                print("min_idx", min_idx)
+            self.embedding[min_idx].data.copy_(0.9 * self.embedding[min_idx].to(pred_latent.device) + 0.1 * avg_embedding.squeeze(0))
+            output = self.embedding[min_idx].to(pred_latent.device)
+            # x = torch.cat([output, pred_latent], dim=1)
+            x = output + pred_latent
+            output = self.conv_layers(x)   
+        
+        else:
+            min_idx = self.find_closest_embedding(pred_latent)
+            output = self.embedding[min_idx].unsqueeze(0).to(pred_latent.device)
+            output = output.expand_as(pred_latent)
+            x = torch.cat([output, pred_latent], dim=1)
+            output = self.conv_layers(x)    
+        
+        return output
+
+
+
+
+
+
+
+
+
+
+foundation model
+
+
+
+import torch
+# import torch.nn as nn
+# import torch.nn.functional as F
+
+# class TransformerModeldec_mlm(nn.Module):
+#     def __init__(self, input_channels=32, embed_size=(1, 32, 60, 60, 38), max_register_size=512):
+#         super(TransformerModeldec_mlm, self).__init__()
+        
+#         # 5-layer 3D Conv network
+#         self.conv_layers = nn.Sequential(
+#             nn.Conv3d(64, 64, kernel_size=3, stride=1, padding=1),
+#             nn.ReLU(),
+#             nn.Conv3d(64, 128, kernel_size=3, stride=1, padding=1),
+#             nn.ReLU(),
+#             nn.Conv3d(128, 64, kernel_size=3, stride=1, padding=1),
+#             nn.ReLU(),
+#             nn.Conv3d(64, 32, kernel_size=3, stride=1, padding=1),
+#             nn.ReLU(),
+#             nn.Conv3d(32, 32, kernel_size=3, stride=1, padding=1)
+#         )
+
+#         self.conv_layers_wocat = nn.Sequential(
+#             nn.Conv3d(32, 32, kernel_size=3, stride=1, padding=1),
+#         )
+        
+#         # Register buffer for storing embeddings
+#         self.register_buffer('embedding', torch.zeros((max_register_size, *embed_size)))
+#         self.register_counter = 0
+#         self.max_register_size = max_register_size
+
+#     def forward(self, pred_latent, gt_latent, dice_score=None, is_train=False, mode=None, output=None):
+#         if is_train and dice_score is not None:
+#             if dice_score is not None:
+#                 x = torch.cat([gt_latent, pred_latent], dim=1)
+#                 output = self.conv_layers(x)
+#             else:
+#                 output = self.conv_layers_wocat(pred_latent)
+        
+#         # Update register buffer
+#         if mode=='val' and dice_score is not None:
+#             if mode=='val':
+#                 avg_embedding = gt_latent.detach()
+#                 if self.register_counter < self.max_register_size:
+#                     self.embedding[self.register_counter] = avg_embedding
+#                     self.register_counter += 1
+#                 else:
+#                     print("l2 norm is being used herereererrrrrrrrrrrrrrrrrrrrrrrrrrrr")
+#                     distances = torch.norm(self.embedding.to(pred_latent.device) - avg_embedding, p=2, dim=[1, 2, 3, 4, 5])
+#                     min_idx = torch.argmin(distances)
+#                     print("ghdsjkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkjhgsakghhhhhhhhhlhsdddddhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh", min_idx)
+#                     self.embedding[min_idx] = 0.5 * self.embedding[min_idx].to(pred_latent.device) + 0.5 * avg_embedding
+        
+#         elif not is_train and dice_score is not None:
+#             if dice_score is not None:
+#                 avg_embedding = pred_latent
+#                 distances = torch.norm(self.embedding.to(pred_latent.device) - avg_embedding, p=2, dim=[1, 2, 3, 4, 5])
+#                 min_idx = torch.argmin(distances)
+#                 print("ghdsjkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkjhgsakghhhhhhhhhlhsdddddhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh", min_idx)
+#                 output = self.embedding[min_idx].to(pred_latent.device) + pred_latent
+#             else:
+#                 output = pred_latent
+
+
+#         if output == None:
+#             output = pred_latent
+        
+            
+#         return output
+
+

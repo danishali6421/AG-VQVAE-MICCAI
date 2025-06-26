@@ -1,0 +1,8 @@
+Collecting cupy-cuda11x
+  Downloading cupy_cuda11x-13.3.0-cp310-cp310-manylinux2014_x86_64.whl.metadata (2.7 kB)
+Requirement already satisfied: numpy<2.3,>=1.22 in /home/danish/anaconda3/envs/custombts/lib/python3.10/site-packages (from cupy-cuda11x) (1.26.4)
+Requirement already satisfied: fastrlock>=0.5 in /home/danish/anaconda3/envs/custombts/lib/python3.10/site-packages (from cupy-cuda11x) (0.8.2)
+Downloading cupy_cuda11x-13.3.0-cp310-cp310-manylinux2014_x86_64.whl (96.6 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 96.6/96.6 MB 3.4 MB/s eta 0:00:00
+Installing collected packages: cupy-cuda11x
+Successfully installed cupy-cuda11x-13.3.0
