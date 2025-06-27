@@ -60,6 +60,8 @@ python main.py \
 ```
 ```
 
+
+```
 ### 4️⃣ Run Inference
 
 Once all **three VQ-VAE modules** and their corresponding **three conditional segmentation networks** have been trained for each tumor region (e.g., WT, TC, ET), you can perform inference using the trained conditional networks.
