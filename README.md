@@ -81,5 +81,5 @@ python main.py \
     --num_workers $NUM_WORKERS \
     --checkpoint_dir $CHECKPOINT_DIR \
     $COND \
-
+```
 
