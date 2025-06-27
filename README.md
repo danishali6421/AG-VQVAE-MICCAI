@@ -18,4 +18,11 @@ Follow these steps to set up and run the project.
 git clone https://github.com/danishali6421/AG-VQVAE-MICCAI.git
 cd AG-VQVAE-MICCAI
 
+### 2️⃣ Set Up Environment (Custom Name)
+
+Create the environment with a name of your choice (e.g., `vqvae_env`):
+
+```bash
+conda env create -f environment.yml -n vqvae_env
+conda activate vqvae_env
 
