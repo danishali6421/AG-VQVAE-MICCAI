@@ -6,6 +6,18 @@ An Attention-Guided Vector Quantized Variational Autoencoder (AG-VQ-VAE) — a t
 
 ![Architecture Diagram](output/architecture.png)
 
+## 📊 Ablation Study: Effect of Attention Scaling (AS) and Soft Masking (SM)
+
+Ablation study on Attention Scaling (AS) and Soft Masking (SM) to evaluate the performance of the single-stage **AG-UNet** and two-stage **AG-VQ-VAE**.
+
+| Model                   | AS ✔ | SM ✔ | HD95 ↓ WT | HD95 ↓ TC | HD95 ↓ ET | Dice ↑ WT | Dice ↑ TC | Dice ↑ ET |
+|-------------------------|:----:|:----:|:---------:|:---------:|:---------:|:---------:|:---------:|:---------:|
+| AG-UNet (Single-stage)  | ✔    | ✔    | 6.15      | 5.39      | 4.37      | **93.19** | 88.26     | **85.09** |
+| AG-VQ-VAE (Two-stage)   | ✔    | ✔    | **5.01**  | **4.10**  | **3.74**  | 92.64     | **89.05** | 82.25     |
+| AG-VQ-VAE (Two-stage)   | ✔    | ✖    | 5.87      | 4.64      | 4.20      | 91.35     | 88.51     | 80.27     |
+| AG-VQ-VAE (Two-stage)   | ✖    | ✔    | 5.57      | 4.99      | 4.43      | 91.74     | 87.88     | 80.41     |
+
+
 ## 🚀 Getting Started
 
 Follow these steps to set up and run the project.
