@@ -12,10 +12,13 @@ Ablation study on Attention Scaling (AS) and Soft Masking (SM) to evaluate the p
 
 | Model                   | AS ✔ | SM ✔ | HD95 ↓ WT | HD95 ↓ TC | HD95 ↓ ET | Dice ↑ WT | Dice ↑ TC | Dice ↑ ET |
 |-------------------------|:----:|:----:|:---------:|:---------:|:---------:|:---------:|:---------:|:---------:|
+| AG-UNet (Single-stage)  | ✖    | ✔    | 6.42      | 5.95      | 4.71      | 92.84     | 87.70     | 83.02     |
+| AG-UNet (Single-stage)  | ✔    | ✖    | 6.53      | 6.17      | 4.54      | 92.92     | 86.59     | 83.57     |
 | AG-UNet (Single-stage)  | ✔    | ✔    | 6.15      | 5.39      | 4.37      | **93.19** | 88.26     | **85.09** |
 | AG-VQ-VAE (Two-stage)   | ✔    | ✔    | **5.01**  | **4.10**  | **3.74**  | 92.64     | **89.05** | 82.25     |
 | AG-VQ-VAE (Two-stage)   | ✔    | ✖    | 5.87      | 4.64      | 4.20      | 91.35     | 88.51     | 80.27     |
 | AG-VQ-VAE (Two-stage)   | ✖    | ✔    | 5.57      | 4.99      | 4.43      | 91.74     | 87.88     | 80.41     |
+
 
 
 ## 🚀 Getting Started
