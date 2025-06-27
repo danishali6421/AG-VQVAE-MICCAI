@@ -23,6 +23,12 @@ Comparison across three tumor subregions: **Whole Tumor (WT)**, **Tumor Core (TC
 | **Ours (AG-VQ-VAE)**| **5.01** | **4.10**  | **3.74**  | **4.28**   | **92.64** | 89.05     | 82.25     | 87.98       |
 
 
+## 🖼️ Qualitative Results
+
+Visualization of MRI slices, ground truth masks, and predicted masks across three test samples.
+
+![Qualitative Results](output/qualitative_results.png)
+
 
 
 ## 📊 Ablation Study: Effect of Attention Scaling (AS) and Soft Masking (SM)
