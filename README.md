@@ -6,6 +6,25 @@ An Attention-Guided Vector Quantized Variational Autoencoder (AG-VQ-VAE) — a t
 
 ![Architecture Diagram](output/architecture.png)
 
+
+## 📈 Results on BraTS 2021
+
+Comparison across three tumor subregions: **Whole Tumor (WT)**, **Tumor Core (TC)**, and **Enhancing Tumor (ET)**.  
+**Best results are highlighted in bold.**
+
+| Method             | HD95 ↓ WT | HD95 ↓ TC | HD95 ↓ ET | HD95 ↓ AVG | Dice ↑ WT | Dice ↑ TC | Dice ↑ ET | Dice ↑ AVG |
+|--------------------|:---------:|:---------:|:---------:|:----------:|:---------:|:---------:|:---------:|:----------:|
+| 3D U-Net           | 11.49     | 6.18      | 6.15      | 7.94       | 89.59     | 86.28     | 83.39     | 86.42       |
+| TransBTS           | 15.12     | 8.21      | 7.83      | 10.38      | 89.25     | 85.35     | 80.35     | 84.99       |
+| UNETR              | 15.99     | 10.01     | 9.72      | 11.90      | 90.10     | 83.66     | 79.78     | 84.51       |
+| NestedFormer       | 10.23     | 6.43      | 6.08      | 7.58       | 90.12     | 88.18     | 85.62     | 87.97       |
+| DBTrans            | 9.84      | 6.24      | 6.13      | 7.40       | 92.41     | 90.26     | 86.70     | 89.79       |
+| Causal Intervention| 13.92     | **5.85**  | **6.43**  | 8.73       | 92.32     | **91.19** | **87.21** | **90.24**   |
+| **Ours (AG-VQ-VAE)**| **5.01** | **4.10**  | **3.74**  | **4.28**   | **92.64** | 89.05     | 82.25     | 87.98       |
+
+
+
+
 ## 📊 Ablation Study: Effect of Attention Scaling (AS) and Soft Masking (SM)
 
 Ablation study on Attention Scaling (AS) and Soft Masking (SM) to evaluate the performance of the single-stage **AG-UNet** and two-stage **AG-VQ-VAE**.
