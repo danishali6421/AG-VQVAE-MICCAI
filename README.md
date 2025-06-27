@@ -57,9 +57,8 @@ python main.py \
     $COND \
     $CONDTRAINING \
     #$RESUME
-``````
-
-
+```
+```
 ```
 ### 4️⃣ Run Inference
 
