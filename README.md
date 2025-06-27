@@ -19,7 +19,8 @@ git clone https://github.com/danishali6421/AG-VQVAE-MICCAI.git
 cd AG-VQVAE-MICCAI
 
 
-### 2️⃣ Set Up Environment (Custom Name)
+
+## 2️⃣ Set Up Environment (Custom Name)
 
 Create the environment with a name of your choice (e.g., `vqvae_env`):
 
