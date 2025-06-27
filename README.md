@@ -86,6 +86,8 @@ python main.py \
     $VQVAE \
     $VQVAETRAINING \
     #$RESUME
+
+After Setting run.sh then use terminal and run (./run.sh)
 STAGE2 Training
 python main.py \
     --data_path $DATA_PATH \
@@ -97,6 +99,7 @@ python main.py \
     $COND \
     $CONDTRAINING \
     #$RESUME
+After Setting run.sh then use terminal and run (./run.sh)
 ``` ```
 ```
 ### 4️⃣ Run Inference
@@ -116,5 +119,6 @@ python main.py \
     --num_workers $NUM_WORKERS \
     --checkpoint_dir $CHECKPOINT_DIR \
     $COND \
+After Setting run.sh then use terminal and run (./run.sh)
 ```
 
