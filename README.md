@@ -58,4 +58,26 @@ python main.py \
     $CONDTRAINING \
     #$RESUME
 ```
+```
+
+### 4️⃣ Run Inference
+
+Once all **three VQ-VAE modules** and their corresponding **three conditional segmentation networks** have been trained for each tumor region (e.g., WT, TC, ET), you can perform inference using the trained conditional networks.
+
+---
+
+### 🛠️ Modify `run.sh` for Inference
+
+In your `run.sh`, configure the variables as follows:
+
+```bash
+python main.py \
+    --data_path $DATA_PATH \
+    --modalities $MODALITIES \
+    --crop_size $CROP_SIZE \
+    --batch_size $BATCH_SIZE \
+    --num_workers $NUM_WORKERS \
+    --checkpoint_dir $CHECKPOINT_DIR \
+    $COND \
+
 
