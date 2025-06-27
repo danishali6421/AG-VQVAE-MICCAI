@@ -35,6 +35,7 @@ conda activate vqvae_env
 Use the following command inside your `run.sh` to train either **Stage 1** (VQ-VAE) or **Stage 2** (Conditional Network). You will manually **modify the variables** depending on which stage you're training.
 
 ```bash
+STAGE 1 Training
 python main.py \
     --data_path $DATA_PATH \
     --modalities $MODALITIES \
@@ -44,8 +45,17 @@ python main.py \
     --checkpoint_dir $CHECKPOINT_DIR \
     $VQVAE \
     $VQVAETRAINING \
+    #$RESUME
+STAGE2 Training
+python main.py \
+    --data_path $DATA_PATH \
+    --modalities $MODALITIES \
+    --crop_size $CROP_SIZE \
+    --batch_size $BATCH_SIZE \
+    --num_workers $NUM_WORKERS \
+    --checkpoint_dir $CHECKPOINT_DIR \
     $COND \
     $CONDTRAINING \
-    $RESUME
+    #$RESUME
 ```
 
