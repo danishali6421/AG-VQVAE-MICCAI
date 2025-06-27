@@ -17,7 +17,7 @@ Follow these steps to set up and run the project.
 ```bash
 git clone https://github.com/danishali6421/AG-VQVAE-MICCAI.git
 cd AG-VQVAE-MICCAI
-
+```
 
 
 
