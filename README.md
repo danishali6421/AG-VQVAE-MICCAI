@@ -28,4 +28,24 @@ Create the environment with a name of your choice (e.g., `vqvae_env`):
 ```bash
 conda env create -f environment.yml -n vqvae_env
 conda activate vqvae_env
+```
+
+### 3️⃣ Train the Model
+
+Use the following command inside your `run.sh` to train either **Stage 1** (VQ-VAE) or **Stage 2** (Conditional Network). You will manually **modify the variables** depending on which stage you're training.
+
+```bash
+python main.py \
+    --data_path $DATA_PATH \
+    --modalities $MODALITIES \
+    --crop_size $CROP_SIZE \
+    --batch_size $BATCH_SIZE \
+    --num_workers $NUM_WORKERS \
+    --checkpoint_dir $CHECKPOINT_DIR \
+    $VQVAE \
+    $VQVAETRAINING \
+    $COND \
+    $CONDTRAINING \
+    $RESUME
+```
 
