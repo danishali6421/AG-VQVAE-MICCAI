@@ -326,7 +326,7 @@ def train_vae(model, train_loader, train_dataset_len, optimizer, device):
            
             
     
-            loss = (0,75*re_norm_combined_loss + quantization_loss)
+            loss = (0.75*re_norm_combined_loss + quantization_loss)
             print("total loss is", loss / 3)
             loss_tr = loss*batch_images
             quantization_loss=quantization_loss.item()*batch_images
@@ -410,7 +410,7 @@ def validate_vae(model, model_inferer, dataloader, val_dataset_len, device):
                     class_losses_sum_overall_wo[key]+=((combined_loss[idx].item())*batch_images)
 
               
-                loss = (0,75*re_norm_combined_loss + quantization_loss)
+                loss = (0.75*re_norm_combined_loss + quantization_loss)
                 print("total loss is", loss / 3)
                 loss_val = loss*batch_images
                 quantization_loss=quantization_loss.item()*batch_images
