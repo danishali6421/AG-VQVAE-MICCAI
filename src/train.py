@@ -326,7 +326,7 @@ def train_vae(model, train_loader, train_dataset_len, optimizer, device):
            
             
     
-            loss = (0.7*re_norm_combined_loss + quantization_loss)
+            loss = (0.75*re_norm_combined_loss + quantization_loss)
             print("total loss is", loss / 3)
             loss_tr = loss*batch_images
             quantization_loss=quantization_loss.item()*batch_images
