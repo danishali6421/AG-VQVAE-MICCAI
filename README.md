@@ -30,6 +30,16 @@ Visualization of MRI slices, ground truth masks, and predicted masks across thre
 ![Qualitative Results](output/qualitative_results.png)
 
 
+## 🖼️ Additional Qualitative Results
+
+Additional visualizations highlighting the comparison between the proposed two-stage AG-VQ-VAE network (without skip connections) and the single-stage AG-UNet (with skip connections) are presented. While the single-stage AG-UNet leverages low-level spatial features through skip connections, the two-stage AG-VQ-VAE demonstrates superior boundary delineation and structural accuracy. These qualitative results clearly illustrate the effectiveness of the proposed architecture in capturing fine-grained tumor details, validating its advantage over conventional U-Net-based models.
+
+![Qualitative Results](output/q_r_1.png)
+
+
+![Qualitative Results](output/q_r_2.png)
+
+
 
 ## 📊 Ablation Study: Effect of Attention Scaling (AS) and Soft Masking (SM)
 
